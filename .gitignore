@@ -1,0 +1,23 @@
+# Build
+bin/
+obj/
+*.user
+*~
+
+# Python bytecode cache (tools/package_mod.py)
+__pycache__/
+*.pyc
+
+# Packaged mod archives (./package-mod.sh)
+dist/
+
+# Artifacts
+*.vscr
+*.vscap
+*.vcdbs
+
+# Scratch output of the README quick start (vschunkdump demo)
+demo/
+
+# Ignore .folders
+**/.*/**

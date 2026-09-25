@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>VsVcdbsProbe</AssemblyName>
+    <RootNamespace>VsVcdbsProbe</RootNamespace>
+    <NoWarn>$(NoWarn);CS0618;NU1701</NoWarn>
+    <VintageStory Condition="'$(VintageStory)' == ''">$(VINTAGE_STORY)</VintageStory>
+  </PropertyGroup>
+
+  <Target Name="CheckVintageStory" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(VintageStory)' == ''"
+           Text="VINTAGE_STORY is not set: point it at the Vintage Story installation directory (export VINTAGE_STORY=/path/to/VintageStory)." />
+    <Error Condition="!Exists('$(VintageStory)/VintagestoryLib.dll')"
+           Text="There is no VintagestoryLib.dll in '$(VintageStory)' — check VINTAGE_STORY." />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryLib">
+      <HintPath>$(VintageStory)/VintagestoryLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VintageStory)/VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="protobuf-net">
+      <HintPath>$(VintageStory)/Lib/protobuf-net.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Data.Sqlite">
+      <HintPath>$(VintageStory)/Lib/Microsoft.Data.Sqlite.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SQLitePCLRaw.core">
+      <HintPath>$(VintageStory)/Lib/SQLitePCLRaw.core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SQLitePCLRaw.batteries_v2">
+      <HintPath>$(VintageStory)/Lib/SQLitePCLRaw.batteries_v2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SQLitePCLRaw.provider.e_sqlite3">
+      <HintPath>$(VintageStory)/Lib/SQLitePCLRaw.provider.e_sqlite3.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

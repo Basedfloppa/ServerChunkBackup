@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\$(Configuration)\Mods\vsfullcapture</OutputPath>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>VsFullCapture</AssemblyName>
+    <RootNamespace>VsFullCapture</RootNamespace>
+    <VintageStory Condition="'$(VintageStory)' == ''">$(VINTAGE_STORY)</VintageStory>
+  </PropertyGroup>
+
+  <!--
+    The capture container is shared with the offline tools: we compile the
+    VsChunkDump.Core sources directly into the mod so it stays a single assembly.
+  -->
+  <ItemGroup>
+    <Compile Include="..\VsChunkDump.Core\*.cs" LinkBase="Core" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      VintagestoryLib is a closed assembly, but it is the only way to reach
+      Packet_ServerChunk and SystemNetworkProcess. The official mod template can
+      reference it with the IncludeVintagestoryLib key.
+      0Harmony does NOT need to ship with the mod: the engine picks up
+      $(VINTAGE_STORY)/Lib/0Harmony.dll itself through its AssemblyResolve.
+    -->
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VintageStory)/VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VintagestoryLib">
+      <HintPath>$(VintageStory)/VintagestoryLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(VintageStory)/Lib/0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="modinfo.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="modicon.png" Condition="Exists('modicon.png')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/VsChunkDump.Cli/VsChunkDump.Cli.csproj" />
+    <Project Path="src/VsChunkDump.Core/VsChunkDump.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/VsChunkDump.Core.Tests/VsChunkDump.Core.Tests.csproj" />
+  </Folder>
+</Solution>
