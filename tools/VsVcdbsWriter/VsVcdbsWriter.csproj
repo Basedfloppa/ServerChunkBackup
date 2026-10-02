@@ -27,6 +27,7 @@
     <Compile Include="..\..\src\VsFullCapture\PacketMapping.cs" Link="Shared\PacketMapping.cs" />
     <Compile Include="..\..\src\VsFullCapture\WorldBuild\WorldBuilder.cs" Link="Shared\WorldBuilder.cs" />
     <Compile Include="..\..\src\VsFullCapture\WorldBuild\ChunkBlobWriter.cs" Link="Shared\ChunkBlobWriter.cs" />
+    <Compile Include="..\..\src\VsFullCapture\WorldBuild\EntitySaveData.cs" Link="Shared\EntitySaveData.cs" />
     <Compile Include="..\..\src\VsFullCapture\WorldBuild\BlockEntityRewrite.cs" Link="Shared\BlockEntityRewrite.cs" />
     <Compile Include="..\..\src\VsFullCapture\WorldBuild\GameZstdCodec.cs" Link="Shared\GameZstdCodec.cs" />
     <Compile Include="..\..\src\VsFullCapture\WorldBuild\TemplateFactory.cs" Link="Shared\TemplateFactory.cs" />

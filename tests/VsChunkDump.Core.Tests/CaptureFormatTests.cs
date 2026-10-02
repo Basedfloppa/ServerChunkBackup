@@ -97,11 +97,73 @@ public class CaptureFormatTests
     }
 
     [Fact]
-    public void CorruptedPayload_IsDetectedByCrc()
+    public void DamagedRecord_IsSkippedAndTheRestIsRead()
+    {
+        using var tmp = new TempDir("capture-damaged");
+        using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest()))
+        {
+            writer.Write(CaptureRecordType.ServerIdentification, Payload(100, 1));
+            writer.Write(CaptureRecordType.Chunk, Payload(5000, 2));
+            writer.Write(CaptureRecordType.Chunk, Payload(5000, 3));
+            writer.Write(CaptureRecordType.MapChunk, Payload(100, 4));
+        }
+
+        // The capture is appended to across game runs, so damage stays in the middle of
+        // the file: flip a byte of the second record's body.
+        string file = Path.Combine(tmp.Path, CaptureFormat.FileName);
+        var bytes = File.ReadAllBytes(file);
+        bytes[CaptureFormat.FileHeaderSize + CaptureFormat.RecordHeaderSize + 100 + 30] ^= 0xFF;
+        File.WriteAllBytes(file, bytes);
+
+        var issues = new List<CaptureReadIssue>();
+        var records = CaptureReader.Read(tmp.Path, issues.Add).ToList();
+
+        Assert.Equal(3, records.Count);
+        Assert.Equal(CaptureRecordType.ServerIdentification, records[0].Type);
+        Assert.Equal(Payload(5000, 3), records[1].Payload);
+        Assert.Equal(CaptureRecordType.MapChunk, records[2].Type);
+
+        var issue = Assert.Single(issues);
+        Assert.True(issue.Recovered, "the reader found the next record, so the gap is recoverable");
+        Assert.Contains("checksum", issue.Describe());
+    }
+
+    [Fact]
+    public void WipedRecord_IsSkippedAndTheRestIsRead()
+    {
+        using var tmp = new TempDir("capture-wiped");
+        using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest()))
+        {
+            writer.Write(CaptureRecordType.ServerIdentification, Payload(100, 1));
+            writer.Write(CaptureRecordType.Chunk, Payload(5000, 2));
+            writer.Write(CaptureRecordType.Chunk, Payload(5000, 3));
+            writer.Write(CaptureRecordType.MapChunk, Payload(100, 4));
+        }
+
+        // A whole record (header and body) replaced by zeros: the reader sees no header at
+        // all and has to find the next record by content.
+        string file = Path.Combine(tmp.Path, CaptureFormat.FileName);
+        var bytes = File.ReadAllBytes(file);
+        int start = CaptureFormat.FileHeaderSize + CaptureFormat.RecordHeaderSize + 100;
+        Array.Clear(bytes, start, Math.Min(300, bytes.Length - start));
+        File.WriteAllBytes(file, bytes);
+
+        var issues = new List<CaptureReadIssue>();
+        var records = CaptureReader.Read(tmp.Path, issues.Add).ToList();
+
+        Assert.Equal(3, records.Count);
+        Assert.Equal(Payload(5000, 3), records[1].Payload);
+        Assert.Equal(CaptureRecordType.MapChunk, records[2].Type);
+        Assert.True(Assert.Single(issues).Recovered);
+    }
+
+    [Fact]
+    public void CorruptedLastRecord_StopsWithAnIssue()
     {
         using var tmp = new TempDir("capture-corrupt");
         using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest()))
         {
+            writer.Write(CaptureRecordType.ServerIdentification, Payload(100, 1));
             writer.Write(CaptureRecordType.Chunk, Payload(5000));
         }
 
@@ -110,11 +172,19 @@ public class CaptureFormatTests
         bytes[^1] ^= 0xFF;
         File.WriteAllBytes(file, bytes);
 
-        Assert.Throws<InvalidDataException>(() => CaptureReader.Read(tmp.Path).ToList());
+        var issues = new List<CaptureReadIssue>();
+        var records = CaptureReader.Read(tmp.Path, issues.Add).ToList();
+
+        Assert.Single(records);
+        Assert.Equal(CaptureRecordType.ServerIdentification, records[0].Type);
+
+        var issue = Assert.Single(issues);
+        Assert.False(issue.Recovered, "nothing readable follows, so there is no boundary to resync to");
+        Assert.Contains("not read", issue.Describe());
     }
 
     [Fact]
-    public void TruncatedLastRecord_StopsCleanlyAndKeepsEarlierRecords()
+    public void TruncatedLastRecord_ReportsAnIncompleteTail()
     {
         using var tmp = new TempDir("capture-truncated");
         using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest()))
@@ -128,9 +198,67 @@ public class CaptureFormatTests
         var bytes = File.ReadAllBytes(file);
         File.WriteAllBytes(file, bytes[..(bytes.Length - 1234)]);
 
-        var records = CaptureReader.Read(tmp.Path).ToList();
+        var issues = new List<CaptureReadIssue>();
+        var records = CaptureReader.Read(tmp.Path, issues.Add).ToList();
+
         Assert.Single(records);
         Assert.Equal(CaptureRecordType.ServerIdentification, records[0].Type);
+        Assert.False(Assert.Single(issues).Recovered);
+    }
+
+    [Fact]
+    public void IncompleteTail_IsTrimmedWhenTheCaptureIsReopened()
+    {
+        using var tmp = new TempDir("capture-trim");
+        using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest()))
+        {
+            writer.Write(CaptureRecordType.ServerIdentification, Payload(100, 1));
+            writer.Write(CaptureRecordType.Chunk, Payload(5000, 2));
+        }
+
+        string file = Path.Combine(tmp.Path, CaptureFormat.FileName);
+        long goodLength = new FileInfo(file).Length;
+
+        // A record whose header landed but whose body did not: the game was killed mid-write.
+        var stub = new byte[CaptureFormat.RecordHeaderSize + 40];
+        CaptureFormat.WriteRecordHeader(stub, CaptureRecordType.Chunk, 0, 900, 900, 0x1234_5678);
+        File.WriteAllBytes(file, [.. File.ReadAllBytes(file), .. stub]);
+
+        var log = new List<string>();
+        using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest(), log: log.Add))
+        {
+            writer.Write(CaptureRecordType.MapChunk, Payload(100, 3));
+        }
+
+        Assert.Contains(log, m => m.Contains("tail trimmed"));
+
+        var records = CaptureReader.Read(tmp.Path).ToList();
+        Assert.Equal(3, records.Count);
+        Assert.Equal(Payload(5000, 2), records[1].Payload);
+        Assert.Equal(Payload(100, 3), records[2].Payload);
+        Assert.Equal(goodLength + CaptureFormat.RecordHeaderSize + 100, new FileInfo(file).Length);
+    }
+
+    [Fact]
+    public void CleanCapture_IsNotTrimmed()
+    {
+        using var tmp = new TempDir("capture-clean");
+        using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest()))
+        {
+            writer.Write(CaptureRecordType.Chunk, Payload(5000, 2));
+        }
+
+        string file = Path.Combine(tmp.Path, CaptureFormat.FileName);
+        long length = new FileInfo(file).Length;
+
+        var log = new List<string>();
+        using (var writer = new CaptureWriter(tmp.Path, new CaptureManifest(), log: log.Add))
+        {
+            writer.Write(CaptureRecordType.MapChunk, Payload(100, 3));
+        }
+
+        Assert.DoesNotContain(log, m => m.Contains("trimmed"));
+        Assert.Equal(length + CaptureFormat.RecordHeaderSize + 100, new FileInfo(file).Length);
     }
 
     [Fact]

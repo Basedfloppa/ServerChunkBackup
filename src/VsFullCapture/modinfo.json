@@ -5,7 +5,7 @@
   "name": "Server Chunk Backup",
   "authors": [ "zorolin" ],
   "description": "Save you explored chunks as a local save file for offline experiments or build backup.",
-  "version": "1.0.0",
+  "version": "1.2.6",
   "side": "Client",
   "dependencies": {
     "game": "1.22.7"

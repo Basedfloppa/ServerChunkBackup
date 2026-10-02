@@ -51,6 +51,133 @@ public sealed class BlockEntityUpdatePayload
     public List<BlockEntityPayload> BlockEntities = [];
 }
 
+/// <summary>
+/// One entity as the savegame stores it: the class name plus the bytes of
+/// <c>Entity.ToBytes(forClient: false)</c> (without the class name — the same split
+/// the game uses for block entities).
+///
+/// The position is carried separately as well: the builder needs it to know which
+/// chunk section the entity belongs to, while digging it out of <see cref="SaveData"/>
+/// would mean parsing the game's format here.
+/// </summary>
+public sealed class EntityPayload
+{
+    public long EntityId;
+    public string Classname = "";
+    public double X, Y, Z;
+    public byte[] SaveData = [];
+
+    /// <summary>
+    /// Connection (game session, 1-based) whose records last mentioned this entity.
+    /// Not part of the format: <see cref="CaptureModel"/> fills it while reading, by
+    /// counting identification records. A client only learns that an entity is gone
+    /// while it is tracking it, so an entity last seen several connections ago may
+    /// have been dead on the server for a long time — this is how old the knowledge is.
+    /// </summary>
+    public int LastConnection;
+}
+
+/// <summary>
+/// An entity removed from the world for good. "Out of range", "unloaded" and
+/// "last player disconnected" are NOT removals: the entity still exists on the
+/// server, the client has merely stopped tracking it.
+/// </summary>
+public sealed class EntityDespawnPayload
+{
+    public long EntityId;
+
+    /// <summary>
+    /// The reason the game gave, a byte of <c>EnumDespawnReason</c>. Only diagnostics:
+    /// the builder needs nothing but the id. <see cref="Unknown"/> means a record written
+    /// before the reason was stored — the field is optional and the payload is then 8 bytes.
+    /// </summary>
+    public byte Reason = Unknown;
+
+    public const byte Unknown = 255;
+}
+
+/// <summary>
+/// The calendar as the game states it: settings, not a moment. They say where the clock
+/// started and how fast it runs. A world with a different <see cref="HoursPerDay"/> or
+/// month length turns the same clock into a different date, so they have to travel with
+/// the clock — and both the time of day and the season come out of that one number.
+/// </summary>
+public sealed class CalendarSettings
+{
+    /// <summary>
+    /// The clock value the world was created with; the difference to the current clock
+    /// is the world's age (<c>Calendar.ElapsedDays</c>).
+    /// </summary>
+    public long TotalSecondsStart;
+
+    public float HoursPerDay = 24f;
+    public int DaysPerMonth = 9;
+
+    /// <summary>How much faster the calendar runs than real time.</summary>
+    public float CalendarSpeedMul = 0.5f;
+
+    /// <summary>Time speed modifiers, normally a single "baseline" = 60.</summary>
+    public List<TimeSpeedModifier> TimeSpeedModifiers = [];
+
+    /// <summary>
+    /// Whether these came from the server's calendar packet. When false they were read
+    /// from the client's own calendar: the day length and the month length are still the
+    /// server's (the client is told them), but the time speed modifiers are assumed to
+    /// be the default ones — the client API does not expose them.
+    /// </summary>
+    public bool FromServer;
+
+    public readonly record struct TimeSpeedModifier(string Name, float Speed);
+}
+
+/// <summary>
+/// The state of the world at capture time: the game clock and where the player stood.
+///
+/// Both halves are what makes the assembled world open at the captured moment instead
+/// of its own midnight, with the player already at the captured place: the game keeps
+/// the clock in <c>SaveGame.TotalGameSeconds</c> and the place in
+/// <c>SaveGame.DefaultSpawn</c>. Time of day, day of the year and season are all derived
+/// from that one clock value, so nothing else has to be stored to reproduce them.
+/// </summary>
+public sealed class WorldStatePayload
+{
+    /// <summary>
+    /// World clock in game seconds — the value the game keeps in
+    /// <c>SaveGame.TotalGameSeconds</c>. Taken from the client's calendar, which is the
+    /// same clock the server will save, only read later: the client is set from the
+    /// server's calendar packets and advances the clock locally in between, so its value
+    /// is the freshest view of it.
+    /// </summary>
+    public long TotalSeconds;
+
+    public CalendarSettings Calendar = new();
+
+    /// <summary>
+    /// The date as the game renders it, in the player's UI language (for example
+    /// "July 4, 1387, 07:30").
+    ///
+    /// Display only: the save is set from <see cref="TotalSeconds"/>, and the two come
+    /// from one reading of the same clock, so the log cannot name a date other than the
+    /// one the world will open at.
+    /// </summary>
+    public string? ClientDate;
+
+    /// <summary>
+    /// Season at the player's position as reported by the game. Taken rather than
+    /// computed, because it depends on the latitude and the hemisphere, which the
+    /// offline builder cannot reproduce. Display only.
+    /// </summary>
+    public string? Season;
+
+    /// <summary>Whether the player was in the world at that moment.</summary>
+    public bool HasPlayer;
+
+    public double PlayerX, PlayerY, PlayerZ;
+
+    /// <summary>Facing, so the assembled world does not turn the player a random way.</summary>
+    public float PlayerYaw;
+}
+
 /// <summary>World parameters from the server identification packet.</summary>
 public sealed class WorldInfoPayload
 {
@@ -182,6 +309,134 @@ public static class CapturePayloadCodec
         using var ms = new MemoryStream(payload.ToArray(), writable: false);
         using var r = new BinaryReader(ms, Encoding.UTF8);
         return new BlockEntityUpdatePayload { BlockEntities = ReadBlockEntities(r) };
+    }
+
+    // ---------------------------------------------------------------- entities
+
+    public static byte[] Encode(EntityPayload e)
+    {
+        using var ms = new MemoryStream(e.SaveData.Length + 64);
+        using var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+        w.Write(e.EntityId);
+        w.Write(e.Classname);
+        w.Write(e.X);
+        w.Write(e.Y);
+        w.Write(e.Z);
+        WriteBytes(w, e.SaveData);
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    public static EntityPayload DecodeEntity(ReadOnlySpan<byte> payload)
+    {
+        using var ms = new MemoryStream(payload.ToArray(), writable: false);
+        using var r = new BinaryReader(ms, Encoding.UTF8);
+        return new EntityPayload
+        {
+            EntityId = r.ReadInt64(),
+            Classname = r.ReadString(),
+            X = r.ReadDouble(),
+            Y = r.ReadDouble(),
+            Z = r.ReadDouble(),
+            SaveData = ReadBytes(r) ?? []
+        };
+    }
+
+    public static byte[] Encode(EntityDespawnPayload p)
+    {
+        using var ms = new MemoryStream(sizeof(long) + 1);
+        using var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+        w.Write(p.EntityId);
+        w.Write(p.Reason);
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    public static EntityDespawnPayload DecodeEntityDespawn(ReadOnlySpan<byte> payload)
+    {
+        using var ms = new MemoryStream(payload.ToArray(), writable: false);
+        using var r = new BinaryReader(ms, Encoding.UTF8);
+        var despawn = new EntityDespawnPayload { EntityId = r.ReadInt64() };
+        // The reason was added later and is optional: an 8-byte payload is a record
+        // from a build that did not store it yet.
+        if (ms.Length - ms.Position >= 1) despawn.Reason = r.ReadByte();
+        return despawn;
+    }
+
+    // ------------------------------------------------------------- world state
+
+    public static byte[] Encode(WorldStatePayload s)
+    {
+        using var ms = new MemoryStream(128);
+        using var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+        w.Write(s.TotalSeconds);
+        WriteCalendar(w, s.Calendar);
+        w.Write(s.HasPlayer);
+        w.Write(s.PlayerX);
+        w.Write(s.PlayerY);
+        w.Write(s.PlayerZ);
+        w.Write(s.PlayerYaw);
+        w.Write(s.ClientDate ?? "");
+        w.Write(s.Season ?? "");
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    public static WorldStatePayload DecodeWorldState(ReadOnlySpan<byte> payload)
+    {
+        using var ms = new MemoryStream(payload.ToArray(), writable: false);
+        using var r = new BinaryReader(ms, Encoding.UTF8);
+        var s = new WorldStatePayload
+        {
+            TotalSeconds = r.ReadInt64(),
+            Calendar = ReadCalendar(r),
+            HasPlayer = r.ReadBoolean(),
+            PlayerX = r.ReadDouble(),
+            PlayerY = r.ReadDouble(),
+            PlayerZ = r.ReadDouble(),
+            PlayerYaw = r.ReadSingle()
+        };
+
+        // The two strings sit at the tail, so a record written before they existed
+        // still decodes — the rendering of the date and the season is then simply lost.
+        s.ClientDate = ReadOptionalString(r);
+        s.Season = ReadOptionalString(r);
+        return s;
+    }
+
+    private static void WriteCalendar(BinaryWriter w, CalendarSettings calendar)
+    {
+        w.Write(calendar.TotalSecondsStart);
+        w.Write(calendar.HoursPerDay);
+        w.Write(calendar.DaysPerMonth);
+        w.Write(calendar.CalendarSpeedMul);
+        w.Write(calendar.FromServer);
+        w.Write(calendar.TimeSpeedModifiers.Count);
+        foreach (var modifier in calendar.TimeSpeedModifiers)
+        {
+            w.Write(modifier.Name);
+            w.Write(modifier.Speed);
+        }
+    }
+
+    private static CalendarSettings ReadCalendar(BinaryReader r)
+    {
+        var calendar = new CalendarSettings
+        {
+            TotalSecondsStart = r.ReadInt64(),
+            HoursPerDay = r.ReadSingle(),
+            DaysPerMonth = r.ReadInt32(),
+            CalendarSpeedMul = r.ReadSingle(),
+            FromServer = r.ReadBoolean()
+        };
+
+        int count = r.ReadInt32();
+        if (count < 0) return calendar;
+        for (int i = 0; i < count; i++)
+        {
+            calendar.TimeSpeedModifiers.Add(new CalendarSettings.TimeSpeedModifier(r.ReadString(), r.ReadSingle()));
+        }
+        return calendar;
     }
 
     // ------------------------------------------------- server identification
@@ -376,6 +631,18 @@ public static class CapturePayloadCodec
     {
         if (r.BaseStream.Position >= r.BaseStream.Length) return null;
         return ReadBytes(r);
+    }
+
+    /// <summary>
+    /// Optional string at the tail of a record — see <see cref="ReadOptionalBytes"/>.
+    /// An empty string decodes as absent: these fields are "what the game showed", and
+    /// "nothing recorded" is what an empty one means.
+    /// </summary>
+    private static string? ReadOptionalString(BinaryReader r)
+    {
+        if (r.BaseStream.Position >= r.BaseStream.Length) return null;
+        string value = r.ReadString();
+        return value.Length == 0 ? null : value;
     }
 
     private static void WriteInts(BinaryWriter w, int[]? values)

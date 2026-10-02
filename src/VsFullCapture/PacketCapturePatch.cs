@@ -131,6 +131,22 @@ internal static class PacketCapturePatch
                 break;
             }
 
+            // The calendar packet carries the settings that turn a clock into a date:
+            // where the clock started, the hours of a day, the time speed. Settings only —
+            // the clock itself is read from the client's calendar on the tick, which is
+            // the same clock advanced further (see WorldStateCapture).
+            //
+            // CalendarUpdate is deliberately not captured: it carries nothing but the two
+            // clock values, and the client's own calendar already tracks those.
+            case Packet_ServerIdEnum.Calendar:
+            {
+                if (!Config().CaptureWorldState) return;
+                var calendar = packet.Calendar;
+                if (calendar == null) return;
+                WorldStateCapture.OnServerCalendar(calendar);
+                break;
+            }
+
             // MapRegion is deliberately not saved: its contents are not used when
             // building the world, and the game rebuilds regions from the seed itself.
         }

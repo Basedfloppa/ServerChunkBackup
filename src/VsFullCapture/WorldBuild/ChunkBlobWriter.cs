@@ -16,10 +16,10 @@ namespace VsFullCapture;
 /// exactly what comes over the network. So we write the blob ourselves:
 ///
 ///   1  blocksCompressed     2  lightCompressed      3  lightSatCompressed
-///   7  blockEntitiesCount   8  blockEntities[]      9  moddata
-///   10 lightPositions       12 gameVersionCreated   13 emptyBeforeSave
-///   14 decors (index3d,blockId)                      15 savedCompressionVersion
-///   16 liquidsCompressed
+///   5  entitiesCount        6  entities[]           7  blockEntitiesCount
+///   8  blockEntities[]      9  moddata              10 lightPositions
+///   12 gameVersionCreated   13 emptyBeforeSave      14 decors (index3d,blockId)
+///   15 savedCompressionVersion                      16 liquidsCompressed
 ///
 /// Fields that are absent are not written at all (the game serializer does the
 /// same: it skips zeros and nulls, and the reader gets default values).
@@ -34,6 +34,7 @@ public static class ChunkBlobWriter
         byte[]? light,
         byte[]? lightSat,
         byte[]? liquids,
+        IReadOnlyList<byte[]> entities,
         IReadOnlyList<byte[]> blockEntities,
         IDictionary<string, byte[]>? moddata,
         IEnumerable<int>? lightPositions,
@@ -47,6 +48,15 @@ public static class ChunkBlobWriter
         FastSerializer.Write(ms, 1, blocks!);
         FastSerializer.Write(ms, 2, light!);
         FastSerializer.Write(ms, 3, lightSat!);
+
+        // The game writes the count only when there is something to count, and the
+        // entries themselves only when the entity array is non-empty (FastSerializeEntitiesCount
+        // / FastSerializeEntities).
+        if (entities.Count > 0)
+        {
+            FastSerializer.Write(ms, 5, entities.Count);
+            FastSerializer.Write(ms, 6, entities);
+        }
 
         if (blockEntities.Count > 0) FastSerializer.Write(ms, 7, blockEntities.Count);
         FastSerializer.Write(ms, 8, blockEntities);
@@ -73,16 +83,17 @@ public static class ChunkBlobWriter
     }
 
     /// <summary>
-    /// Write a block entity in the form the game reads it when loading a chunk:
-    /// <c>BinaryReader.ReadString()</c> of the class name, then the TreeAttribute
-    /// bytes (ServerChunk.FromBytes → AfterDeserialization).
+    /// One entry of fields 6/8 ("class name + payload"): the game reads it when loading
+    /// a chunk with <c>BinaryReader.ReadString()</c> followed by the payload bytes
+    /// (ServerChunk.FromBytes → AfterDeserialization). For a block entity the payload is
+    /// a TreeAttribute, for an entity — <c>Entity.ToBytes(forClient: false)</c>.
     /// </summary>
-    public static byte[] ToSaveEntry(string classname, byte[] treeBytes)
+    public static byte[] ToSaveEntry(string classname, byte[] payloadBytes)
     {
-        using var ms = new MemoryStream(treeBytes.Length + classname.Length + 8);
+        using var ms = new MemoryStream(payloadBytes.Length + classname.Length + 8);
         using var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
         w.Write(classname);
-        w.Write(treeBytes);
+        w.Write(payloadBytes);
         w.Flush();
         return ms.ToArray();
     }

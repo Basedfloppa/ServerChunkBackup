@@ -22,6 +22,22 @@ public readonly struct BlockEntityRewriteStats
 
     /// <summary>Failed to parse the TreeAttribute — the data was left as is.</summary>
     public int Failed { get; init; }
+
+    /// <summary>
+    /// The block the entity declares as its own ("blockCode"), if the data carries it.
+    /// The game puts the block into the entity from exactly this field, and on the
+    /// client it looks the block up by position. A mismatch between the two is what
+    /// makes classes like BlockEntityCage throw.
+    /// </summary>
+    public string? BlockCode { get; init; }
+
+    /// <summary>Whether the data carried the position (posx/posy/posz).</summary>
+    public bool HasPosition { get; init; }
+
+    /// <summary>The position from the data — the one the game uses, not the packet's.</summary>
+    public int PosX { get; init; }
+    public int PosY { get; init; }
+    public int PosZ { get; init; }
 }
 
 /// <summary>
@@ -68,6 +84,8 @@ public static class BlockEntityRewrite
         }
 
         int asCodes = 0, unknown = 0, decorTranslated = 0;
+        string? blockCode = tree.GetString("blockCode");
+        bool hasPosition = tree["posx"] is IntAttribute && tree["posy"] is IntAttribute && tree["posz"] is IntAttribute;
 
         // We only translate materials and decorIds for a chiseled block (class
         // MicroBlock): modded block entities may have attributes with the same
@@ -114,7 +132,11 @@ public static class BlockEntityRewrite
         {
             // Nothing was changed — keep the original bytes so we do not touch the
             // data of block entities we do not understand.
-            stats = new BlockEntityRewriteStats { Total = 1 };
+            stats = new BlockEntityRewriteStats
+            {
+                Total = 1, BlockCode = blockCode, HasPosition = hasPosition,
+                PosX = tree.GetInt("posx"), PosY = tree.GetInt("posy"), PosZ = tree.GetInt("posz")
+            };
             return be.Data;
         }
 
@@ -124,7 +146,10 @@ public static class BlockEntityRewrite
             Rewritten = 1,
             MaterialsAsCodes = asCodes,
             MaterialsUnknown = unknown,
-            DecorIdsTranslated = decorTranslated
+            DecorIdsTranslated = decorTranslated,
+            BlockCode = blockCode,
+            HasPosition = hasPosition,
+            PosX = tree.GetInt("posx"), PosY = tree.GetInt("posy"), PosZ = tree.GetInt("posz")
         };
         return tree.ToBytes();
     }

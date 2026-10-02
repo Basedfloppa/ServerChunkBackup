@@ -23,6 +23,9 @@ public sealed class AutoWorldBuilder
     private readonly ICoreClientAPI _capi;
     private int _running;
 
+    /// <summary>Notes gathered while reading the capture, appended to build.log.</summary>
+    private readonly StringBuilder _details = new();
+
     public AutoWorldBuilder(FullCaptureConfig config, ILogger logger, string captureRoot, ICoreClientAPI capi)
     {
         _config = config;
@@ -85,7 +88,28 @@ public sealed class AutoWorldBuilder
         try
         {
             _logger.Notification("Reading capture: {1}", FullCaptureModSystem.ModId, captureRoot);
-            var model = CaptureModel.Load(captureRoot, m => _logger.Warning("{1}", FullCaptureModSystem.ModId, m));
+            var model = CaptureModel.Load(captureRoot, m =>
+            {
+                _logger.Warning("{1}", FullCaptureModSystem.ModId, m);
+                _details.AppendLine("  " + m.Trim());
+            });
+
+            if (model.DamagedRegions > 0)
+            {
+                string damage = $"Capture is damaged: {model.DamagedRegions} region(s), "
+                                + $"{model.DamagedBytes / 1024.0:F1} KiB lost. Everything after the damage was read; "
+                                + "the world may miss the chunks and entities in those few records.";
+                _logger.Warning("{1}", FullCaptureModSystem.ModId, damage);
+                _details.AppendLine("  " + damage);
+            }
+
+            if (model.TruncatedTail)
+            {
+                string tail = "The capture ends with an incomplete record — the last moment before the game "
+                              + "was terminated is missing.";
+                _logger.Warning("{1}", FullCaptureModSystem.ModId, tail);
+                _details.AppendLine("  " + tail);
+            }
 
             var (complete, noMapChunk, incomplete) = model.ColumnReadiness();
             _logger.Notification(
@@ -94,6 +118,8 @@ public sealed class AutoWorldBuilder
 
             if (complete < _config.MinColumnsToBuild)
             {
+                Finish(captureRoot, "SKIP",
+                    $"Not built: only {complete} complete columns in the capture, {_config.MinColumnsToBuild} required.");
                 _logger.Warning(
                     "Too little data ({1} complete columns < {2}) — not building the world.",
                     FullCaptureModSystem.ModId, complete, _config.MinColumnsToBuild);
@@ -105,6 +131,7 @@ public sealed class AutoWorldBuilder
 
             if (File.Exists(path) && !_config.OverwriteBuiltWorld)
             {
+                Finish(captureRoot, "SKIP", $"Not built: \"{name}\" already exists and overwriting is disabled.");
                 _logger.Warning("World \"{1}\" already exists and overwriting is disabled.", FullCaptureModSystem.ModId, name);
                 return;
             }
@@ -116,11 +143,12 @@ public sealed class AutoWorldBuilder
                 WorldName = name,
                 LocalRegistry = localRegistry,
                 MissingBlockCode = _config.MissingBlockCode,
+                EntityMaxAgeConnections = _config.EntityMaxAgeConnections,
                 // The world's existence and OverwriteBuiltWorld were already checked above.
                 Force = true
-                // WriteBlockIds stays enabled by default: WorldBuilder turns it off
-                // itself if ids are translated in the data (otherwise the remapper
-                // would shift the blocks a second time).
+                // WriteBlockIds stays enabled: the world always needs the id → code table,
+                // and WorldBuilder picks the right one — the target registry when the ids
+                // are translated, the server's otherwise.
             };
 
             var report = WorldBuilder.Build(model, options,
@@ -137,16 +165,18 @@ public sealed class AutoWorldBuilder
                     report.IdTranslation ?? "block ids translated using the supplied map");
                 _logger.Notification(
                     "Palettes: entries {0}, changed {1}, replaced with fallback block {2} "
-                    + "(compressed layers {3}, raw {4}). Not writing BlockIDs — no remapper needed.",
+                    + "(compressed layers {3}, raw {4}).",
                     report.PaletteEntries, report.PaletteChanged,
                     report.PaletteFallback, report.PaletteCompressedLayers, report.PaletteRawLayers);
             }
 
             _logger.Notification(
-                "Block entities: {0} (rewritten {1}, skipped {2}); "
-                + "chiseled materials translated to codes {3}",
+                "Block entities: {0} (rewritten {1}, skipped {2}, of them {3} not on their block); "
+                + "chiseled materials translated to codes {4}",
                 report.BlockEntities, report.BlockEntitiesRewritten,
-                report.BlockEntitiesDropped, report.MaterialsAsCodes);
+                report.BlockEntitiesDropped,
+                report.BlockEntitiesStaleBlock + report.BlockEntitiesWrongBlock,
+                report.MaterialsAsCodes);
 
             if (report.BlockEntities == 0)
             {
@@ -156,18 +186,74 @@ public sealed class AutoWorldBuilder
             }
 
             _logger.Notification(
+                "Entities: {0} written of {1} in the capture (skipped {2}, superseded {3}, older than the bound {4}, "
+                + "bound {5})",
+                report.Entities, report.EntitiesInCapture, report.EntitiesDropped,
+                report.EntitiesSuperseded, report.EntitiesTooOld,
+                report.EntityMaxAgeUsed < 0 ? "none" : $"{report.EntityMaxAgeUsed} connection(s)");
+
+            if (report.EntitiesInCapture == 0)
+            {
+                _logger.Warning(
+                    "No entities in the capture: mobs, dropped items and item frames will be missing in the world. "
+                    + "The capture was taken by a build without their support (or with CaptureEntities disabled) — "
+                    + "a new capture from the server is needed.");
+            }
+
+            _logger.Notification(
                 "World built: {0} columns, {1} chunks, {2} heightmaps → {3}",
                 report.ColumnsWritten, report.ChunksWritten,
                 report.MapChunksWritten, path);
             _logger.Notification("Open it in singleplayer: \"{0}\"", name);
+
+            Finish(captureRoot, "OK",
+                $"Built \"{name}\": {report.ColumnsWritten} columns, {report.ChunksWritten} chunks, "
+                + $"{report.Entities} of {report.EntitiesInCapture} entities"
+                + (report.EntitiesSuperseded > 0
+                    ? $" ({report.EntitiesSuperseded} superseded by a later look at their chunk)"
+                    : "")
+                + $", {report.BlockEntities} block entities{(model.DamagedRegions > 0 ? $", {model.DamagedRegions} damaged region(s) skipped" : "")}. "
+                + $"Open it in singleplayer.");
         }
         catch (Exception e)
         {
             _logger.Error("Failed to build the world: {1}", FullCaptureModSystem.ModId, e);
+            Finish(captureRoot, "FAIL", "Build failed: " + e.Message);
         }
         finally
         {
             Volatile.Write(ref _running, 0);
+        }
+    }
+
+    /// <summary>
+    /// Say how the build ended, in three places at once. The log is where the details are,
+    /// but a build runs after the player has left the world — without a word in chat and a
+    /// line on disk, a build that fails every time looks exactly like a build that works.
+    /// </summary>
+    private void Finish(string captureRoot, string status, string summary)
+    {
+        _logger.Notification("{0}", summary);
+
+        try
+        {
+            File.AppendAllText(Path.Combine(captureRoot, "build.log"),
+                $"{DateTime.Now:u}  {status,-4}  {summary}{Environment.NewLine}{_details}");
+        }
+        catch (Exception)
+        {
+            // A build that cannot write its own report must still report through chat and the log.
+        }
+
+        try
+        {
+            _capi.Event.EnqueueMainThreadTask(
+                () => _capi.ShowChatMessage("[serverchunkbackup] " + summary),
+                "vsfullcapture-build");
+        }
+        catch (Exception)
+        {
+            // The world may already be gone; the log and build.log still carry the outcome.
         }
     }
 

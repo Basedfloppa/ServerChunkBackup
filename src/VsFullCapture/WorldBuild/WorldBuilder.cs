@@ -41,6 +41,27 @@ public sealed class BuildOptions
 
     public int Dim { get; set; }
 
+    /// <summary>
+    /// An optional extra bound on top of the chunk rule: leave out entities that no record
+    /// has mentioned for more than this many connections (game sessions) — see
+    /// <see cref="CaptureModel.EntitiesByAge"/>. Non-positive (the default) applies no such
+    /// bound, and entity freshness is decided by the chunk rule alone.
+    ///
+    /// The chunk rule is the one that matters and is always applied: an entity is left out
+    /// when the chunk it stands in was received again in a later connection that recorded
+    /// entities, and the entity was not among them. A capture is appended to across game
+    /// runs, so it holds what the client saw over many sessions rather than the state of
+    /// the server, and a mob that died out of view never produces a despawn record — but a
+    /// place the client never returned to says nothing about its mobs, so nothing there is
+    /// erased. See <see cref="CaptureModel.SupersedeConnections"/>.
+    ///
+    /// This bound exists for the leftovers of the other case: a capture whose newest
+    /// connections never covered some chunk, so the rule has nothing to compare against.
+    /// A positive value cuts by age instead. The build log always reports how many were
+    /// left out and why.
+    /// </summary>
+    public int EntityMaxAgeConnections { get; set; } = -1;
+
     /// <summary>Write mapchunk rows. Without them the game silently ignores our chunks.</summary>
     public bool WriteMapChunks { get; set; } = true;
 
@@ -53,10 +74,8 @@ public sealed class BuildOptions
     /// via ServerSystemBlockIdRemapper is unreliable — it moves live blocks and
     /// conflicts with those not in the table. Translation in the data does not depend on it.
     ///
-    /// IMPORTANT: BlockIDs must not be written together with translation — otherwise
-    /// the game would move the blocks a second time, on top of the already translated
-    /// ones. <see cref="WorldBuilder"/> disables <see cref="WriteBlockIds"/> itself
-    /// when translation is set.
+    /// With translation the world still needs a BlockIDs table — the TARGET registry
+    /// ("id in this world → code"), not the server's. See <see cref="WriteBlockIds"/>.
     /// </summary>
     public Dictionary<int, int>? BlockIdMap { get; set; }
 
@@ -78,10 +97,18 @@ public sealed class BuildOptions
     public string? MissingBlockCode { get; set; }
 
     /// <summary>
-    /// Write the block registry from the capture into gamedata.ModData["BlockIDs"].
+    /// Write the id → code table into gamedata.ModData["BlockIDs"]. The game's
+    /// ServerSystemBlockIdRemapper reads it on AssetsFirstLoaded, learns from it what
+    /// the ids in the chunks mean, and moves its live blocks to those ids. The table is
+    /// therefore ALWAYS needed, and it must describe the numbering of the chunks:
     ///
-    /// Only needed when ids are NOT translated (that is, <see cref="BlockIdMap"/> is
-    /// not set): then the only chance is to ask the game to remap the blocks itself.
+    ///   • ids translated — the table is <see cref="LocalRegistry"/>, the registry the
+    ///     translation was made into;
+    ///   • ids not translated — the table is the capture's server registry.
+    ///
+    /// With an empty table the remapper has nothing to learn from and keeps its own
+    /// numbering: every chunk is then read with the blocks shifted, and a block entity
+    /// whose class reads its block (BlockEntityCage, for one) throws on the client.
     /// </summary>
     public bool WriteBlockIds { get; set; } = true;
 
@@ -105,6 +132,24 @@ public sealed class BuildReport
 
     /// <summary>A string like "id translation: N entries (in place X, shifted Y, missing locally Z)".</summary>
     public string? IdTranslation;
+
+    /// <summary>
+    /// Block entities whose declared block is missing from the target registry: the block
+    /// itself was replaced with the fallback (air by default), so the entity is left
+    /// without a block. Such entries are not written — the game deletes them on load, and
+    /// a class that reads its block (BlockEntityCage) throws instead.
+    /// </summary>
+    public int BlockEntitiesStaleBlock;
+
+    /// <summary>
+    /// Block entities whose block at their position is a different block (an entity left
+    /// over from before its block was removed or replaced). Not written: the game deletes
+    /// them on load with a warning, and a class that reads its block throws on the client.
+    /// </summary>
+    public int BlockEntitiesWrongBlock;
+
+    /// <summary>Block entities without a "blockCode" — there is nothing to compare them against.</summary>
+    public int BlockEntitiesNoBlockCode;
 
     /// <summary>How many palette entries were rewritten (total across block and liquid layers).</summary>
     public long PaletteEntries;
@@ -136,6 +181,41 @@ public sealed class BuildReport
 
     /// <summary>Block entities that failed to parse and were skipped.</summary>
     public long BlockEntitiesDropped;
+
+    /// <summary>How many entities were written into chunks (mobs, dropped items, item frames).</summary>
+    public long Entities;
+
+    /// <summary>How many entities the capture holds in total.</summary>
+    public long EntitiesInCapture;
+
+    /// <summary>
+    /// Entities of the capture that were not written: their chunk is not in the
+    /// assembled world (an incomplete column or a column without a heightmap).
+    /// </summary>
+    public long EntitiesNotWritten;
+
+    /// <summary>Entities whose data was empty or had no class name and were skipped.</summary>
+    public long EntitiesDropped;
+
+    /// <summary>
+    /// Entities left out because their chunk was received again later, in a connection that
+    /// recorded entities, and they were not among them — stale knowledge the capture itself
+    /// superseded (<see cref="CaptureModel.SupersedeConnections"/>).
+    /// </summary>
+    public long EntitiesSuperseded;
+
+    /// <summary>Entities left out by the optional age bound (<see cref="BuildOptions.EntityMaxAgeConnections"/>, positive only).</summary>
+    public long EntitiesTooOld;
+
+    /// <summary>The age bound the build applied: the option's value when it is positive, otherwise -1 (none).</summary>
+    public int EntityMaxAgeUsed = -1;
+
+    /// <summary>
+    /// Chunk sections whose last receipt came from a connection that recorded no entity, so
+    /// the rule had no newer entity information about them and kept their entities as they
+    /// were — see <see cref="CaptureModel.ChunksWithoutNewerEntityInfo"/>.
+    /// </summary>
+    public int ChunksWithoutNewerEntityInfo;
 
     /// <summary>Chunks that arrived with a compression version different from the one the builder writes.</summary>
     public int ChunkCompressionMismatch;
@@ -254,6 +334,7 @@ public static class WorldBuilder
         }
 
         ResolveBlockIdMap(model, options, report, log);
+        BlockRegistryTable? blockIdsTable = ResolveBlockIdsTable(model, options, report, log);
 
         if (useTemplate)
         {
@@ -265,16 +346,18 @@ public static class WorldBuilder
             string worldName = string.IsNullOrWhiteSpace(options.WorldName)
                 ? "Captured world"
                 : options.WorldName;
-            TemplateFactory.CreateNew(outputPath, model, worldName, options.WriteBlockIds, log);
+            TemplateFactory.CreateNew(outputPath, model, worldName, blockIdsTable, log);
             log($"World created from scratch: {outputPath}");
 
             // The block registry has already been written into this save by TemplateFactory.
-            report.BlockRegistrySize = options.WriteBlockIds ? model.Assets.Blocks.Count : 0;
+            report.BlockRegistrySize = blockIdsTable?.Count ?? 0;
             report.BlockIdsWritten = report.BlockRegistrySize > 0;
         }
 
         var pool = new StandaloneChunkDataPool();
-        var codec = options.BlockIdMap is { Count: > 0 } ? new GameZstdCodec() : null;
+        // The codec is needed both for translation and for the "which block is under this
+        // entity" check (the bit planes are always a zstd frame), so it is unconditional.
+        var codec = new GameZstdCodec();
         var serverRegistry = model.BlockRegistry();
 
         // Group the captured chunks by column.
@@ -289,6 +372,24 @@ public static class WorldBuilder
             list.Add(chunk);
         }
         report.ColumnsCaptured = byColumn.Count;
+
+        // Entities of the capture, grouped by the chunk section their position falls into.
+        //
+        // The entity set is narrowed by the chunk rule, not by a global cut-off: an entity
+        // is left out only when the chunk it stands in was received again in a later
+        // connection that recorded entities and the entity was not among them. A chunk that
+        // was never received again keeps its entities — no information about it is not
+        // information that it is empty. See CaptureModel.SupersedeConnections.
+        int entityMaxAge = options.EntityMaxAgeConnections > 0 ? options.EntityMaxAgeConnections : -1;
+        report.EntityMaxAgeUsed = entityMaxAge;
+        report.ChunksWithoutNewerEntityInfo = model.ChunksWithoutNewerEntityInfo;
+
+        EntityScope entityScope = default;
+        var entitiesByChunk = model.Entities.Count > 0
+            ? model.GroupEntitiesByChunk(entityMaxAge, out entityScope)
+            : new Dictionary<(int X, int Y, int Z), List<EntityPayload>>();
+        report.EntitiesSuperseded = entityScope.Superseded;
+        report.EntitiesTooOld = entityScope.TooOld;
 
         var chunkRows = new List<DbChunk>(model.Chunks.Count);
         var mapChunkRows = new List<DbChunk>(byColumn.Count);
@@ -315,9 +416,16 @@ public static class WorldBuilder
 
             foreach (var chunk in chunks)
             {
+                IReadOnlyList<EntityPayload>? chunkEntities = null;
+                if (entitiesByChunk.TryGetValue((chunk.X, chunk.Y, chunk.Z), out var list))
+                {
+                    chunkEntities = list;
+                }
+
                 chunkRows.Add(new DbChunk(
                     new ChunkPos(chunk.X, chunk.Y, chunk.Z, options.Dim),
-                    BuildChunkBlob(chunk, pool, options.BlockIdMap, codec, report, serverRegistry, model)));
+                    BuildChunkBlob(chunk, pool, options.BlockIdMap, codec, report, serverRegistry, model,
+                        chunkEntities, options.LocalRegistry)));
                 report.ChunksWritten++;
 
                 // The pool accumulates freed layer arrays and does not hand them out
@@ -373,11 +481,51 @@ public static class WorldBuilder
                 + "Check that the capture's game version matches the installed one.");
         }
 
-        if (report.BlockEntitiesDropped > 0)
+        if (report.BlockEntitiesUnparsed > 0)
         {
             report.Warnings.Add(
-                $"{report.BlockEntitiesDropped} block entities failed to parse and were skipped — "
+                $"{report.BlockEntitiesUnparsed} block entities failed to parse and were skipped — "
                 + "the corresponding chiseled blocks, chests and machines will stay empty in the world.");
+        }
+
+        int notOnTheirBlock = report.BlockEntitiesWrongBlock + report.BlockEntitiesStaleBlock;
+        if (notOnTheirBlock > 0)
+        {
+            report.Warnings.Add(
+                $"{notOnTheirBlock} block entities were left over from before their block changed "
+                + "(the capture kept them after the block was removed or replaced) and were not written — "
+                + "the game deletes such entities on load, and a class that reads its block would throw on the client.");
+        }
+
+        // Entities are written into their own chunk: if a column was skipped, its
+        // entities have nowhere to go.
+        report.EntitiesInCapture = model.Entities.Count;
+        report.EntitiesNotWritten = report.EntitiesInCapture - report.Entities - report.EntitiesDropped
+                                    - report.EntitiesSuperseded - report.EntitiesTooOld;
+        if (report.EntitiesNotWritten > 0)
+        {
+            report.Warnings.Add(
+                $"{report.EntitiesNotWritten} of {report.EntitiesInCapture} entities were not written: "
+                + "their chunk is not in the world (the column was not captured in full or has no heightmap). "
+                + "Mobs from those columns will be missing — walk around those places in the game so the "
+                + "client receives the whole column.");
+        }
+
+        if (report.EntitiesSuperseded > 0)
+        {
+            report.Warnings.Add(
+                $"{report.EntitiesSuperseded} of {report.EntitiesInCapture} entities were left out: their chunk was "
+                + "received again later, in a connection that recorded entities, and they were not among them — the "
+                + "capture superseded its own knowledge of them. Places the client never returned to kept their entities.");
+        }
+
+        if (report.EntitiesTooOld > 0)
+        {
+            report.Warnings.Add(
+                $"{report.EntitiesTooOld} of {report.EntitiesInCapture} entities were left out by the age bound: "
+                + $"no record mentioned them for more than {report.EntityMaxAgeUsed} connection(s) "
+                + "(EntityMaxAgeConnections). An entity the client stopped watching may be alive on the server — "
+                + "this bound is applied on top of the chunk rule, not instead of it.");
         }
 
         // --- write to the database ---
@@ -429,21 +577,18 @@ public static class WorldBuilder
         afterTemplateChecks:
 
         // For a template-less build BlockIDs has already been written into the new save.
-        if (options.WriteBlockIds && useTemplate)
+        if (useTemplate && blockIdsTable is { Count: > 0 })
         {
-            var registry = model.BlockRegistry();
-            report.BlockRegistrySize = registry.Count;
-            if (registry.Count == 0)
-            {
-                report.Warnings.Add("No block registry (ServerAssets) in the capture — BlockIDs not written.");
-            }
-            else
-            {
-                WriteBlockIds(db, registry);
-                report.BlockIdsWritten = true;
-                log($"BlockIDs: wrote {registry.Count} id → code mappings");
-            }
+            WriteBlockIds(db, blockIdsTable.Blocks);
+            report.BlockRegistrySize = blockIdsTable.Count;
+            report.BlockIdsWritten = true;
+            log($"BlockIDs: wrote {blockIdsTable.Count} id → code mappings into the template");
         }
+
+        // In a template build gamedata comes from the template, so everything the capture
+        // says about the save itself is written into it here (a from-scratch build does all
+        // of that in TemplateFactory).
+        if (useTemplate) UpdateTemplateGameData(db, model, log);
 
         pool.FreeAll();
 
@@ -451,6 +596,8 @@ public static class WorldBuilder
         if (mapChunkRows.Count > 0) db.SetMapChunks(mapChunkRows);
 
         log($"Chunks written: {report.ChunksWritten}, heightmaps: {report.MapChunksWritten}");
+        log($"Entities written: {report.Entities} of {report.EntitiesInCapture}"
+            + EntityAgeSummary(model, report));
 
         // --- read-back check with the same game class ---
         var positions = chunkRows.Take(50).Select(r => r.Position).ToList();
@@ -458,6 +605,35 @@ public static class WorldBuilder
         log($"Read-back check: {readBack} of {positions.Count} control rows found");
 
         return report;
+    }
+
+    /// <summary>
+    /// What the build did with the entity set, for the build log: how old the knowledge is
+    /// and what the chunk rule left out. A despawn is only captured for an entity the client
+    /// was tracking, so without this line a world full of mobs that died on the server looks
+    /// exactly as good as a freshly walked one.
+    /// </summary>
+    private static string EntityAgeSummary(CaptureModel model, BuildReport report)
+    {
+        if (model.Entities.Count == 0) return "";
+
+        var byAge = model.EntitiesByAge();
+        if (byAge.Count == 0) return "";
+
+        int fresh = byAge.GetValueOrDefault(0);
+        int recent = 0;
+        foreach (var (age, count) in byAge)
+        {
+            if (age is > 0 and <= 3) recent += count;
+        }
+        int older = model.Entities.Count - fresh - recent;
+
+        string text = $"; last seen: {fresh} in the last connection, {recent} within three, {older} earlier";
+        if (report.EntitiesSuperseded > 0) text += $"; {report.EntitiesSuperseded} superseded by a later look at their chunk";
+        if (report.EntitiesTooOld > 0) text += $"; {report.EntitiesTooOld} older than {report.EntityMaxAgeUsed} connection(s)";
+        if (report.ChunksWithoutNewerEntityInfo > 0)
+            text += $"; {report.ChunksWithoutNewerEntityInfo} chunk(s) never revisited with entity data, kept as they were";
+        return text;
     }
 
     /// <summary>Delete the world file and its SQLite journals (-wal, -shm, -journal).</summary>
@@ -495,7 +671,8 @@ public static class WorldBuilder
     /// </summary>
     private static byte[] BuildChunkBlob(ChunkPayload packet, StandaloneChunkDataPool pool,
         Dictionary<int, int>? idMap, IZstdCodec? codec, BuildReport report,
-        IReadOnlyDictionary<int, string>? serverRegistry, CaptureModel model)
+        IReadOnlyDictionary<int, string>? serverRegistry, CaptureModel model,
+        IReadOnlyList<EntityPayload>? entities, BlockRegistryTable? targetRegistry)
     {
         _ = pool; // the pool is no longer needed: the blob is assembled manually
 
@@ -515,7 +692,11 @@ public static class WorldBuilder
 
         // Block entities: without them chiseled blocks, chests, machines and the rest
         // remain empty blocks.
-        var entries = BuildBlockEntityEntries(model.BlockEntitiesFor(packet), serverRegistry, idMap, report);
+        var entries = BuildBlockEntityEntries(
+            model.BlockEntitiesFor(packet), packet.Blocks, codec, serverRegistry, idMap, targetRegistry, report);
+
+        // Entities: mobs, dropped items, item frames sitting in this section.
+        var entityEntries = BuildEntityEntries(entities, report);
 
         var moddata = ReadModdata(packet);
 
@@ -524,6 +705,7 @@ public static class WorldBuilder
             packet.Light,
             packet.LightSat,
             liquids,
+            entityEntries,
             entries,
             moddata,
             packet.LightPositions.Length > 0 ? packet.LightPositions : null,
@@ -533,20 +715,111 @@ public static class WorldBuilder
     }
 
     /// <summary>
+    /// Prepare entity entries for the chunk row. Entities reach the capture already in
+    /// savegame form (<see cref="EntitySaveData"/>), so unlike block entities there is
+    /// nothing to translate inside them — only to pack "class name + bytes".
+    /// </summary>
+    private static List<byte[]> BuildEntityEntries(IReadOnlyList<EntityPayload>? entities, BuildReport report)
+    {
+        if (entities is not { Count: > 0 }) return [];
+
+        var entries = new List<byte[]>(entities.Count);
+        foreach (var entity in entities)
+        {
+            if (entity.SaveData.Length == 0 || string.IsNullOrEmpty(entity.Classname))
+            {
+                report.EntitiesDropped++;
+                continue;
+            }
+            entries.Add(ChunkBlobWriter.ToSaveEntry(entity.Classname, entity.SaveData));
+            report.Entities++;
+        }
+        return entries;
+    }
+
+    /// <summary>
     /// Prepare block entity entries for the chunk row: translate ids inside the data
     /// (chiseled-block materials, decor) and pack them into the save format.
     /// </summary>
     private static List<byte[]> BuildBlockEntityEntries(
         List<BlockEntityPayload> blockEntities,
+        byte[]? blocksBlob,
+        IZstdCodec? codec,
         IReadOnlyDictionary<int, string>? serverRegistry,
         Dictionary<int, int>? idMap,
+        BlockRegistryTable? targetRegistry,
         BuildReport report)
     {
+        // With translation the block at a position is the target registry's block — or the
+        // fallback, when the server's code is missing locally. An entity whose own block
+        // was not written has nothing under it, so it must not be written either.
+        HashSet<string>? targetCodes = null;
+        if (targetRegistry is { Count: > 0 })
+        {
+            targetCodes = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string code in targetRegistry.Blocks.Values)
+                targetCodes.Add(BlockRegistryTable.NormalizeCode(code));
+        }
+
         var entries = new List<byte[]>(blockEntities.Count);
         foreach (var be in blockEntities)
         {
             byte[] data = BlockEntityRewrite.Rewrite(be, serverRegistry, idMap, out var stats);
             report.BlockEntities++;
+
+            // The entity must sit on its own block. The game resolves the block on the
+            // client by position alone (ClientSystemEntities.UpdateBlockEntityData) and
+            // puts it into the entity; if it is not the block the entity declares, the
+            // entity is stale — a leftover from before its block was removed or replaced.
+            if (blocksBlob != null && stats is { HasPosition: true, BlockCode: { Length: > 0 } declared }
+                && serverRegistry is { Count: > 0 })
+            {
+                int px = stats.PosX, py = stats.PosY, pz = stats.PosZ;
+                int lx = px % 32, ly = py % 32, lz = pz % 32;
+                if (lx >= 0 && ly >= 0 && lz >= 0)
+                {
+                    int index = (ly * 32 + lz) * 32 + lx;
+                    if (CombinedLayerBlob.TryReadBlockId(blocksBlob, codec, index, out int underId)
+                        && serverRegistry.TryGetValue(underId, out string? underCode)
+                        && !string.IsNullOrEmpty(underCode)
+                        && BlockRegistryTable.NormalizeCode(underCode) != BlockRegistryTable.NormalizeCode(declared))
+                    {
+                        report.BlockEntitiesWrongBlock++;
+                        report.BlockEntitiesDropped++;
+                        if (report.BlockEntitiesWrongBlock <= 3)
+                        {
+                            report.Warnings.Add(
+                                $"Block entity \"{be.Classname}\" at {px}, {py}, {pz} declares block "
+                                + $"\"{declared}\", but the world has \"{underCode}\" there — the entry is left "
+                                + "over from before the block changed and is not written (the game deletes such "
+                                + "entities, and a class that reads its block would throw on the client).");
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if (targetCodes != null)
+            {
+                if (string.IsNullOrEmpty(stats.BlockCode))
+                {
+                    report.BlockEntitiesNoBlockCode++;
+                }
+                else if (!targetCodes.Contains(BlockRegistryTable.NormalizeCode(stats.BlockCode)))
+                {
+                    report.BlockEntitiesStaleBlock++;
+                    report.BlockEntitiesDropped++;
+                    if (report.BlockEntitiesStaleBlock <= 3)
+                    {
+                        report.Warnings.Add(
+                            $"Block entity \"{be.Classname}\" at {be.X}, {be.Y}, {be.Z} declares block "
+                            + $"\"{stats.BlockCode}\", which this world does not have — the block was replaced "
+                            + "with the fallback, so the entity is not written (the game would delete it, and "
+                            + "a class that reads its block would throw on the client).");
+                    }
+                    continue;
+                }
+            }
             if (stats.Rewritten > 0) report.BlockEntitiesRewritten++;
             report.MaterialsAsCodes += stats.MaterialsAsCodes;
             report.MaterialsUnknown += stats.MaterialsUnknown;
@@ -661,20 +934,49 @@ public static class WorldBuilder
             }
         }
 
-        // Translation and BlockIDs cannot go together: the game would move the blocks
-        // a second time, on top of the translated ones, and everything would break.
-        if (options.BlockIdMap is { Count: > 0 } && options.WriteBlockIds)
-        {
-            options.WriteBlockIds = false;
-            log("Not writing BlockIDs: ids are translated in the data itself (otherwise the remapper would shift the blocks twice).");
-        }
-
         if (options.BlockIdMap is not { Count: > 0 } && !options.WriteBlockIds)
         {
             report.Warnings.Add(
                 "Id translation is not set and BlockIDs is disabled — blocks in the world will have foreign numbering. "
                 + "Specify a local registry (LocalRegistry / --local-registry).");
         }
+    }
+
+    /// <summary>
+    /// The table for gamedata.ModData["BlockIDs"]: the description of the numbering the
+    /// chunks are written in. Translated — the target registry; not translated — the
+    /// capture's server registry.
+    /// </summary>
+    private static BlockRegistryTable? ResolveBlockIdsTable(CaptureModel model, BuildOptions options,
+        BuildReport report, Action<string> log)
+    {
+        if (!options.WriteBlockIds) return null;
+
+        if (options.BlockIdMap is { Count: > 0 })
+        {
+            if (options.LocalRegistry is { Count: > 0 })
+            {
+                log($"BlockIDs: the target registry of the translation — {options.LocalRegistry.Count} id → code mappings"
+                    + " (the game needs it to learn what the ids in the world mean).");
+                return options.LocalRegistry;
+            }
+
+            report.Warnings.Add(
+                "The ids are translated, but the registry they were translated into is unknown, so the world cannot "
+                + "describe its own numbering. Pass it (LocalRegistry / --local-registry): without the table the game "
+                + "reads the chunks with its own block numbering and the blocks come out wrong.");
+            return null;
+        }
+
+        var server = model.BlockRegistry();
+        if (server.Count == 0)
+        {
+            report.Warnings.Add("No block registry (ServerAssets) in the capture — BlockIDs not written.");
+            return null;
+        }
+
+        log($"BlockIDs: the server registry — {server.Count} id → code mappings.");
+        return BlockRegistryTable.FromDictionary(server);
     }
 
     /// <summary>Find the placeholder block id for missing blocks in the local registry.</summary>
@@ -778,6 +1080,53 @@ public static class WorldBuilder
         SaveGame save = SerializerUtil.Deserialize<SaveGame>(raw);
         save.ModData ??= new ConcurrentDictionary<string, byte[]>(4, 16);
         save.ModData[BlockIdsKey] = SerializerUtil.Serialize(registry);
+        db.StoreGameData(SerializerUtil.Serialize(save));
+    }
+
+    /// <summary>
+    /// Raise SaveGame.LastEntityId to the highest captured entity id: the game does not
+    /// restore the counter from chunk rows, so a newly spawned entity would otherwise
+    /// collide with a captured id and be renumbered with a warning in the log.
+    /// </summary>
+    /// <summary>
+    /// gamedata of a template build. The template keeps its own world configuration and
+    /// block tables — that is the point of building onto one — but everything the capture
+    /// knows about the save itself is applied here: the entity id counter (otherwise newly
+    /// spawned entities collide with the captured ids and the server renumbers them) and
+    /// the captured clock and player position.
+    ///
+    /// The clock and the spawn point go through the same methods a from-scratch build uses,
+    /// so the two paths cannot drift apart. The spawn point of the template is left alone
+    /// when the capture has no player position to replace it with.
+    /// </summary>
+    private static void UpdateTemplateGameData(SQLiteDbConnectionv2 db, CaptureModel model, Action<string> log)
+    {
+        byte[] raw = db.GetGameData();
+        if (raw == null || raw.Length == 0) return;
+
+        SaveGame save = SerializerUtil.Deserialize<SaveGame>(raw);
+
+        bool changed = false;
+
+        long maxId = model.HighestEntityId;
+        if (maxId > save.LastEntityId)
+        {
+            save.LastEntityId = maxId;
+            changed = true;
+            log($"Entity id counter: starts after {save.LastEntityId} (the captured entities keep their ids)");
+        }
+
+        if (model.WorldState != null)
+        {
+            TemplateFactory.ApplyWorldState(save, model, log);
+            if (model.WorldState.HasPlayer) TemplateFactory.ApplySpawn(save, model, log);
+            changed = true;
+        }
+
+        // Re-serializing gamedata is what every save of the game does, but there is no reason
+        // to touch the template's own bytes when the capture says nothing new about them.
+        if (!changed) return;
+
         db.StoreGameData(SerializerUtil.Serialize(save));
     }
 }

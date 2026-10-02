@@ -176,6 +176,18 @@ internal static class CapturePipeline
         try { _writer?.FlushStream(); } catch (Exception e) { _logger?.Warning("flush: {0}", e.Message); }
     }
 
+    /// <summary>
+    /// Wait until the queue is empty. Needed before a build: the build reads the capture
+    /// file from disk while the writer thread is still writing records into it, and a
+    /// record whose header has landed but whose body has not is read as a truncated tail.
+    /// Bounded, so a stuck write cannot hang the caller forever.
+    /// </summary>
+    public static void WaitForQueue(int timeoutMs = 10000)
+    {
+        long deadline = Environment.TickCount64 + Math.Max(0, timeoutMs);
+        while (!Queue.IsEmpty && Environment.TickCount64 < deadline) Thread.Sleep(5);
+    }
+
     public static void SaveManifest()
     {
         try { _writer?.SaveManifest(); } catch (Exception e) { _logger?.Warning("manifest: {0}", e.Message); }
@@ -211,7 +223,17 @@ internal static class CapturePipeline
     public static string StatusText()
     {
         string root = Root;
+        string despawns = EntityCapture.DespawnStatusText();
+        string entities = EntityCapture.Tracked > 0
+            ? $" | entities: {EntityCapture.Tracked} tracked (records {EntityCapture.Captured}, "
+              + $"skipped {EntityCapture.Skipped}, errors {EntityCapture.Failed})"
+            : "";
+        // Kept apart from the tracked count: after everything despawned there is nothing
+        // tracked, and the removals are exactly what the status has to show then.
+        if (despawns.Length > 0) entities += $" | despawns: {despawns}";
         return $"records written {Written}, queued {Queued}, dropped {Dropped}, errors {Failed}"
+             + entities
+             + $" | {WorldStateCapture.StatusText()}"
              + (root.Length > 0 ? $" | directory: {root}" : "");
     }
 }

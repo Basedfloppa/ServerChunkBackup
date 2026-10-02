@@ -33,7 +33,8 @@ public static class TemplateFactory
     private const int ChunkDataVersion = 2;
 
     /// <summary>Create a new world file and write gamedata into it.</summary>
-    public static void CreateNew(string path, CaptureModel model, string worldName, bool writeBlockIds, Action<string> log)
+    public static void CreateNew(string path, CaptureModel model, string worldName,
+        BlockRegistryTable? blockIds, Action<string> log)
     {
         var logger = new SilentLogger();
         using var db = new SQLiteDbConnectionv2(logger);
@@ -49,7 +50,7 @@ public static class TemplateFactory
         // In case the database was created for the first time: guarantee the tables.
         db.UpgradeToWriteAccess();
 
-        SaveGame save = BuildSaveGame(model, worldName, writeBlockIds, log);
+        SaveGame save = BuildSaveGame(model, worldName, blockIds, log);
         db.StoreGameData(SerializerUtil.Serialize(save));
 
         log($"Created a new world without a template: MapSize {save.MapSizeX}x{save.MapSizeY}x{save.MapSizeZ}, "
@@ -57,7 +58,8 @@ public static class TemplateFactory
     }
 
     /// <summary>Assemble a SaveGame from the capture.</summary>
-    public static SaveGame BuildSaveGame(CaptureModel model, string worldName, bool writeBlockIds, Action<string> log)
+    public static SaveGame BuildSaveGame(CaptureModel model, string worldName,
+        BlockRegistryTable? blockIds, Action<string> log)
     {
         var info = model.Identification;
 
@@ -111,11 +113,31 @@ public static class TemplateFactory
         };
 
         ApplyWorldConfiguration(save, model, log);
-        if (writeBlockIds) ApplyBlockIds(save, model, log);
+        if (blockIds is { Count: > 0 }) ApplyBlockIds(save, blockIds, log);
+        ApplyEntityIdCounter(save, model, log);
+        ApplyWorldState(save, model, log);
         ApplySpawn(save, model, log);
         BuildWorldConfigBytes(save, log);
 
         return save;
+    }
+
+    /// <summary>
+    /// Continue the entity id counter after the captured entities.
+    ///
+    /// The game does not restore this counter when it loads entities from chunk rows
+    /// (ServerMain.LoadEntity raises SaveGame.LastEntityId in repair mode only), so with
+    /// a counter of 0 every newly spawned entity would hit an id a captured one already
+    /// holds: ServerMain.SpawnEntity logs a warning and renumbers it. Raising the counter
+    /// in advance keeps the log clean and the captured ids intact.
+    /// </summary>
+    private static void ApplyEntityIdCounter(SaveGame save, CaptureModel model, Action<string> log)
+    {
+        long maxId = model.HighestEntityId;
+        if (maxId == 0) return;
+
+        save.LastEntityId = Math.Max(save.LastEntityId, maxId);
+        log($"Entity id counter: starts after {save.LastEntityId} (the captured entities keep their ids)");
     }
 
     /// <summary>
@@ -145,26 +167,78 @@ public static class TemplateFactory
     }
 
     /// <summary>
-    /// Block registry: the game reads it on AssetsFirstLoaded and moves live blocks
-    /// to the saved ids. Without it, with a foreign mod set the blocks would silently
-    /// become the wrong ones.
+    /// Block registry: the game reads it on AssetsFirstLoaded and moves live blocks to
+    /// the saved ids. Without it the game has no way to learn what the ids in the world
+    /// mean and reads every chunk with its own numbering.
+    ///
+    /// Which registry it must be is decided by <see cref="WorldBuilder"/>: the target of
+    /// the translation when the ids are translated, the server's otherwise.
     /// </summary>
-    private static void ApplyBlockIds(SaveGame save, CaptureModel model, Action<string> log)
+    private static void ApplyBlockIds(SaveGame save, BlockRegistryTable registry, Action<string> log)
     {
-        var registry = model.BlockRegistry();
-        if (registry.Count == 0)
-        {
-            log("WARNING: no block registry in the capture — BlockIDs not written.");
-            return;
-        }
-
-        save.ModData["BlockIDs"] = SerializerUtil.Serialize(registry);
+        save.ModData["BlockIDs"] = SerializerUtil.Serialize(registry.Blocks);
         log($"BlockIDs: {registry.Count} id → code mappings");
     }
 
-    /// <summary>Spawn point — the center of the captured area, so the player appears near the builds.</summary>
-    private static void ApplySpawn(SaveGame save, CaptureModel model, Action<string> log)
+    /// <summary>
+    /// The clock the world starts at. The time of day, the day of the year and the season
+    /// are all derived by the game from this one number, so writing it is what saves the
+    /// user from <c>/time set</c> — and the calendar settings travel with it, because a
+    /// world with a different day length would turn the same clock into another date.
+    /// </summary>
+    internal static void ApplyWorldState(SaveGame save, CaptureModel model, Action<string> log)
     {
+        var state = model.WorldState;
+        if (state == null)
+        {
+            log("WARNING: the capture has no world state — the world will start at its own "
+                + "midnight, in its first spring. The capture was taken by a build without its "
+                + "support, or with CaptureWorldState disabled.");
+            return;
+        }
+
+        var calendar = state.Calendar;
+
+        // A negative clock is undefined for the game: it clamps it back to 0 with a warning.
+        long total = Math.Max(0, state.TotalSeconds);
+        save.TotalGameSeconds = total;
+
+        // The world age is the clock minus its start, so a start after the clock would make
+        // it negative. The clock never runs backwards, but a broken capture can.
+        long start = Math.Clamp(calendar.TotalSecondsStart, 0, total);
+        save.TotalGameSecondsStart = start;
+
+        // Zero hours per day makes the game throw on load, and a zero time speed would freeze
+        // the world: on either, the save's own default is kept.
+        if (calendar.HoursPerDay > 0) save.HoursPerDay = calendar.HoursPerDay;
+        if (calendar.CalendarSpeedMul > 0) save.CalendarSpeedMul = calendar.CalendarSpeedMul;
+        if (calendar.TimeSpeedModifiers.Count > 0)
+        {
+            // Grouped, not ToDictionary: a name written twice would throw, and the last
+            // value is the one the game would end up with anyway.
+            save.TimeSpeedModifiers = calendar.TimeSpeedModifiers
+                .GroupBy(m => m.Name)
+                .ToDictionary(g => g.Key, g => g.Last().Speed);
+        }
+
+        log($"Time: {state.ClientDate ?? total + "s"}"
+            + (state.Season != null ? $", {state.Season}" : "")
+            + $" (clock {total}s, world age {(total - start) / 86400.0:F1} days, "
+            + $"{calendar.HoursPerDay:0.##}h day, {calendar.DaysPerMonth}-day months, "
+            + (calendar.FromServer ? "from the server calendar)" : "from the client calendar)"));
+    }
+
+    /// <summary>
+    /// Spawn point — where the player stood when the capture ended, so the assembled world
+    /// opens at the captured place instead of asking for a <c>/tp</c>. Older captures have
+    /// no position, and a position that does not fit the built world is refused: for those
+    /// the centre of the captured area is used, as before.
+    /// </summary>
+    internal static void ApplySpawn(SaveGame save, CaptureModel model, Action<string> log)
+    {
+        var state = model.WorldState;
+        if (state is { HasPlayer: true } && TrySpawnAtPlayer(save, state, log)) return;
+
         if (!TryGetCenter(model, out int centerX, out int centerZ)) return;
 
         save.DefaultSpawn = new PlayerSpawnPos
@@ -174,6 +248,53 @@ public static class TemplateFactory
             z = centerZ
         };
         log($"Spawn point: {centerX}, {centerZ} (center of the captured area)");
+    }
+
+    /// <summary>
+    /// The captured player position as the world's spawn point. Returns false if it cannot
+    /// be used, and then says why.
+    /// </summary>
+    private static bool TrySpawnAtPlayer(SaveGame save, WorldStatePayload state, Action<string> log)
+    {
+        // A position that is not a number would become 0, 0, 0 in the casts below and quietly
+        // put the player in a corner of the map. The capture refuses to write such a position,
+        // but a hand-made record can hold one.
+        if (!double.IsFinite(state.PlayerX) || !double.IsFinite(state.PlayerY) || !double.IsFinite(state.PlayerZ))
+        {
+            log("WARNING: the captured player position is not a number — the spawn point is the "
+                + "centre of the captured area instead.");
+            return false;
+        }
+
+        int x = (int)Math.Floor(state.PlayerX);
+        int y = (int)Math.Floor(state.PlayerY);
+        int z = (int)Math.Floor(state.PlayerZ);
+
+        // A spawn outside the map makes the game throw while loading the world
+        // (ServerMain.EntityPosFromSpawnPos), so it is refused here, where it costs a line
+        // in the log instead of an unloadable world.
+        if (x < 0 || x >= save.MapSizeX || z < 0 || z >= save.MapSizeZ || y < 0 || y >= save.MapSizeY)
+        {
+            log($"WARNING: the captured player position {x}, {y}, {z} is outside the world "
+                + $"({save.MapSizeX}x{save.MapSizeY}x{save.MapSizeZ}) — the spawn point is the centre "
+                + "of the captured area instead.");
+            return false;
+        }
+
+        save.DefaultSpawn = new PlayerSpawnPos
+        {
+            x = x,
+            // The height is kept rather than left to the terrain: the captured position is a
+            // place, not a column, and a player who was in a cave or inside a building would
+            // otherwise be put on the surface above it.
+            y = y,
+            z = z,
+            // The facing is honoured. The pitch is not stored at all: the game overwrites it
+            // with its own value for every spawn point, so recording it would be a lie.
+            yaw = state.PlayerYaw
+        };
+        log($"Spawn point: {x}, {y}, {z} — where the player stood (yaw {state.PlayerYaw:F2})");
+        return true;
     }
 
     /// <summary>

@@ -77,7 +77,8 @@ public class FullCaptureModSystem : ModSystem
                 ModVersion = Mod.Info.Version
             };
             _writer = new CaptureWriter(_captureRoot, manifest,
-                CapturePipeline.CompressionLevelFor(ActiveConfig.CompressionLevel));
+                CapturePipeline.CompressionLevelFor(ActiveConfig.CompressionLevel),
+                m => Mod.Logger.Warning("{0}", m));
         }
         catch (Exception e)
         {
@@ -88,6 +89,14 @@ public class FullCaptureModSystem : ModSystem
 
         CapturePipeline.Start(_writer, ActiveConfig, Mod.Logger);
         InstallPatch();
+
+        // Entities are captured from the live objects (the patch sees nothing about them),
+        // so this is subscribed here and not in the packet patch.
+        if (ActiveConfig.CaptureEntities) EntityCapture.Install(api, Mod.Logger);
+
+        // The world state is read from the client API as well (the clock and the player),
+        // so it is installed unconditionally; the settings are checked where it is used.
+        WorldStateCapture.Install(api, Mod.Logger);
 
         _autoBuilder = new AutoWorldBuilder(ActiveConfig, Mod.Logger, _captureRoot, api);
         api.Event.LeftWorld += OnLeftWorld;
@@ -139,6 +148,9 @@ public class FullCaptureModSystem : ModSystem
         EnsureWorldInfo();
 
         long now = _capi.World.ElapsedMilliseconds;
+        EntityCapture.Tick(now);
+        WorldStateCapture.Tick(now);
+
         if (now - _lastFlushMs >= ActiveConfig.FlushIntervalMs)
         {
             _lastFlushMs = now;
@@ -280,8 +292,13 @@ public class FullCaptureModSystem : ModSystem
         if (_autoBuilder == null)
             return TextCommandResult.Error("Capture is not initialized — is it enabled in the settings?");
 
-        // Flush the buffers so that everything written is included in the build.
+        // Mark the moment the build happens: the periodic snapshot may be half a minute old,
+        // and it is this moment that should decide the time and the spawn point of the world.
+        WorldStateCapture.CaptureNow();
+
+        // Flush and drain the buffers so that everything written is in the file the build reads.
         CapturePipeline.Flush();
+        CapturePipeline.WaitForQueue();
         CapturePipeline.SaveManifest();
 
         string? name = args.Parsers.Count > 0 ? args[0] as string : null;
@@ -302,8 +319,14 @@ public class FullCaptureModSystem : ModSystem
             return;
         }
 
-        // Let the writer thread finish the tail of the queue.
+        // The state of the world just left: the player is still there, but reading the API
+        // while the world is torn down is not safe, so the snapshot from the last tick goes in.
+        WorldStateCapture.WriteLast();
+
+        // Let the writer thread finish the tail of the queue, so that everything captured —
+        // including the state just written — is in the file the build is about to read.
         CapturePipeline.Flush();
+        CapturePipeline.WaitForQueue();
         CapturePipeline.SaveManifest();
 
         // The next server will get its own block registry: it arrives once per
@@ -314,6 +337,14 @@ public class FullCaptureModSystem : ModSystem
         // if the identification packet is not caught, the fallback must work again.
         CapturePipeline.ResetServerInfo();
         _worldInfoFallbackDone = false;
+
+        // Entity ids belong to the world that has just been left: the next server
+        // numbers its entities from scratch.
+        EntityCapture.ResetSession();
+
+        // The calendar belongs to that world as well: its clock would put the next
+        // server's time into the previous world's calendar.
+        WorldStateCapture.ResetSession();
 
         _autoBuilder?.OnLeftWorld();
     }
@@ -339,6 +370,8 @@ public class FullCaptureModSystem : ModSystem
         }
         catch (Exception) { /* see above */ }
 
+        EntityCapture.Uninstall();
+        WorldStateCapture.Uninstall();
         CapturePipeline.Stop();
 
         try { _writer?.Dispose(); } catch (Exception) { /* see above */ }

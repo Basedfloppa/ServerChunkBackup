@@ -37,7 +37,28 @@ public enum CaptureRecordType : ushort
     /// Packet_BlockEntities (id 48): block entity updates outside a chunk —
     /// this is how the server sends an interaction rollback.
     /// </summary>
-    BlockEntityUpdate = 8
+    BlockEntityUpdate = 8,
+
+    /// <summary>
+    /// One entity (mob, dropped item, item frame) in the form the savegame stores it.
+    /// Entities have no packet of their own to capture: the client receives them as
+    /// "sync" data, from which the savegame form cannot be assembled. The mod takes
+    /// it from the live entity instead (see EntitySaveData).
+    /// </summary>
+    Entity = 9,
+
+    /// <summary>An entity gone for good (died, burned up, picked up, expired, removed).</summary>
+    EntityDespawn = 10,
+
+    /// <summary>
+    /// The state of the world at the moment of capture: the game clock and where the
+    /// player stood. The clock is what the game stores in
+    /// <c>SaveGame.TotalGameSeconds</c>, and both the time of day and the season are
+    /// derived from it; the position becomes <c>SaveGame.DefaultSpawn</c>. Without this
+    /// record the assembled world opens at its own midnight, in its first spring, and
+    /// the player has to <c>/time set</c> and <c>/tp</c> to reach the captured place.
+    /// </summary>
+    WorldState = 11
 }
 
 /// <summary>
@@ -74,6 +95,28 @@ public static class CaptureFormat
 
     /// <summary>Threshold below which compression is not applied (small records are not worth compressing).</summary>
     public const int CompressionThreshold = 4096;
+
+    /// <summary>
+    /// Largest record body accepted. No packet the game sends comes close, so a longer
+    /// length is a damaged header — and reading one would try to allocate it.
+    /// </summary>
+    public const uint MaxRecordBytes = 256u * 1024 * 1024;
+
+    /// <summary>How much of the tail is examined when looking for the last complete record.</summary>
+    public const int TailScanBytes = 64 * 1024 * 1024;
+
+    /// <summary>Read exactly the buffer, or report that the stream ended first.</summary>
+    internal static bool TryReadExactly(Stream stream, Span<byte> buffer)
+    {
+        int read = 0;
+        while (read < buffer.Length)
+        {
+            int n = stream.Read(buffer[read..]);
+            if (n <= 0) return false;
+            read += n;
+        }
+        return true;
+    }
 
     public static void WriteFileHeader(Span<byte> buffer)
     {
@@ -144,12 +187,34 @@ public static class CaptureFormat
         CaptureRecordType.MapChunk => "column heightmap",
         CaptureRecordType.MapRegion => "world region",
         CaptureRecordType.BlockEntityUpdate => "block entity update",
+        CaptureRecordType.Entity => "entity",
+        CaptureRecordType.EntityDespawn => "entity despawn",
+        CaptureRecordType.WorldState => "world state (clock and player)",
         _ => "unknown (" + (ushort)type + ")"
     };
 }
 
 /// <summary>One capture record: type and decompressed payload.</summary>
 public sealed record CaptureRecord(CaptureRecordType Type, byte[] Payload, long Offset);
+
+/// <summary>
+/// A gap in the capture file: bytes the reader could not interpret as a record.
+///
+/// A capture is appended to across game runs, so the only damage it can suffer is a
+/// record cut short by an abrupt termination — and once the next run has appended after
+/// such a stub, the damage stays in the middle of the file forever. Skipping it costs
+/// the records in the gap (usually a single chunk) instead of the whole world.
+/// </summary>
+public sealed record CaptureReadIssue(long Offset, long Length, string Reason, bool Recovered)
+{
+    public string Describe()
+    {
+        string position = $"byte {Offset}";
+        return Recovered
+            ? $"damaged capture data at {position}: {Reason}. {Length} bytes skipped, reading continues at the next record."
+            : $"unreadable record at {position} ({Length} bytes left): {Reason}. The data after it is not read.";
+    }
+}
 
 /// <summary>Capture manifest (&lt;dir&gt;/capture.json).</summary>
 public sealed class CaptureManifest
@@ -249,7 +314,7 @@ public sealed class CaptureWriter : IDisposable
     public long RecordsWritten { get { lock (_sync) return _manifest.RecordsWritten; } }
 
     public CaptureWriter(string root, CaptureManifest manifest,
-        CompressionLevel level = CompressionLevel.Fastest)
+        CompressionLevel level = CompressionLevel.Fastest, Action<string>? log = null)
     {
         Root = root;
         _manifest = manifest;
@@ -280,7 +345,62 @@ public sealed class CaptureWriter : IDisposable
             CaptureFormat.WriteFileHeader(header);
             _stream.Write(header);
         }
+        else
+        {
+            TrimIncompleteTail(_stream, log);
+        }
         _stream.Seek(0, SeekOrigin.End);
+    }
+
+    /// <summary>
+    /// Drop a record left half-written by an abrupt termination. Appending after such a
+    /// stub would embed the damage in the middle of the file, where it can never be
+    /// removed again — the reader would have to skip it on every read forever.
+    ///
+    /// Only the tail is examined, and the search starts from the end: the last record
+    /// whose body is complete and whose CRC matches is the file's real end. A clean file
+    /// ends exactly there, so nothing is touched.
+    /// </summary>
+    private static void TrimIncompleteTail(FileStream stream, Action<string>? log)
+    {
+        try
+        {
+            long length = stream.Length;
+            if (length < CaptureFormat.FileHeaderSize + CaptureFormat.RecordHeaderSize) return;
+
+            long window = Math.Min(length - CaptureFormat.FileHeaderSize, CaptureFormat.TailScanBytes);
+            long from = length - window;
+            var tail = new byte[window];
+            stream.Seek(from, SeekOrigin.Begin);
+            if (!CaptureFormat.TryReadExactly(stream, tail)) return;
+
+            for (long i = window - CaptureFormat.RecordHeaderSize; i >= 0; i--)
+            {
+                var span = tail.AsSpan((int)i);
+                if (!CaptureFormat.IsRecordHeader(span)) continue;
+
+                uint payloadLen = BinaryPrimitives.ReadUInt32LittleEndian(span[8..12]);
+                uint crc = BinaryPrimitives.ReadUInt32LittleEndian(span[16..20]);
+                if (payloadLen > CaptureFormat.MaxRecordBytes) continue;
+                if (i + CaptureFormat.RecordHeaderSize + payloadLen > window) continue;
+                if (Crc32.Compute(span.Slice(CaptureFormat.RecordHeaderSize, (int)payloadLen)) != crc) continue;
+
+                long end = from + i + CaptureFormat.RecordHeaderSize + payloadLen;
+                if (end == length) return;
+
+                stream.SetLength(end);
+                log?.Invoke($"Capture tail trimmed: dropped {length - end} bytes of an incomplete record "
+                            + $"(the game was terminated while it was being written).");
+                return;
+            }
+
+            log?.Invoke("Capture tail: no complete record in the last "
+                        + $"{CaptureFormat.TailScanBytes / (1024 * 1024)} MiB — appending as is.");
+        }
+        catch (Exception e)
+        {
+            log?.Invoke($"Capture tail not checked ({e.Message}) — appending as is.");
+        }
     }
 
     /// <summary>
@@ -377,11 +497,26 @@ public sealed class CaptureWriter : IDisposable
     }
 }
 
-/// <summary>Streaming capture reader. Corrupt/truncated records stop reading without breaking the parse.</summary>
+/// <summary>
+/// Streaming capture reader. A record that cannot be read is skipped, not fatal: the
+/// damage an append-only file can collect (a record cut short by a killed game) would
+/// otherwise make every later build fail forever.
+/// </summary>
 public static class CaptureReader
 {
+    /// <summary>CRC-valid records in a row a candidate offset must start with to be a record boundary.</summary>
+    private const int ResyncRunLength = 3;
+
+    /// <summary>How far ahead the reader looks for a record boundary after hitting damage.</summary>
+    private const int ResyncWindow = 4 * 1024 * 1024;
+
+    /// <summary>Upper bound on candidates tried per gap, so a large damaged region cannot stall a build.</summary>
+    private const int ResyncCandidates = 64;
+
+    private const int ScratchBytes = 256 * 1024;
+
     /// <summary>Read all capture records in order.</summary>
-    public static IEnumerable<CaptureRecord> Read(string root)
+    public static IEnumerable<CaptureRecord> Read(string root, Action<CaptureReadIssue>? onIssue = null)
     {
         string path = Path.Combine(root, CaptureFormat.FileName);
         if (!File.Exists(path)) yield break;
@@ -390,6 +525,7 @@ public static class CaptureReader
         if (fs.Length < CaptureFormat.FileHeaderSize) yield break;
 
         var header = new byte[CaptureFormat.RecordHeaderSize];
+        var scratch = new byte[ScratchBytes];
         Span<byte> fileHeader = stackalloc byte[CaptureFormat.FileHeaderSize];
         ReadExactly(fs, fileHeader);
         if (!CaptureFormat.IsFileHeader(fileHeader))
@@ -408,27 +544,163 @@ public static class CaptureReader
         {
             long offset = fs.Position;
             if (offset + CaptureFormat.RecordHeaderSize > fileLength) yield break;
-            if (!TryReadExactly(fs, header)) yield break;
-            if (!CaptureFormat.IsRecordHeader(header)) yield break;
+            if (!CaptureFormat.TryReadExactly(fs, header)) yield break;
 
-            var type = (CaptureRecordType)BinaryPrimitives.ReadUInt16LittleEndian(header[4..6]);
-            ushort flags = BinaryPrimitives.ReadUInt16LittleEndian(header[6..8]);
-            uint payloadLen = BinaryPrimitives.ReadUInt32LittleEndian(header[8..12]);
-            uint rawLen = BinaryPrimitives.ReadUInt32LittleEndian(header[12..16]);
-            uint crc = BinaryPrimitives.ReadUInt32LittleEndian(header[16..20]);
+            bool headerOk = CaptureFormat.IsRecordHeader(header);
+            string reason = headerOk ? "a record body is not there" : "no record header";
 
-            if (offset + CaptureFormat.RecordHeaderSize + payloadLen > fileLength) yield break;
-            var body = new byte[payloadLen];
-            if (!TryReadExactly(fs, body)) yield break;
-            if (Crc32.Compute(body) != crc)
-                throw new InvalidDataException($"CRC mismatch in {path} @ {offset}");
+            if (headerOk)
+            {
+                ushort flags = BinaryPrimitives.ReadUInt16LittleEndian(header[6..8]);
+                uint payloadLen = BinaryPrimitives.ReadUInt32LittleEndian(header[8..12]);
+                uint rawLen = BinaryPrimitives.ReadUInt32LittleEndian(header[12..16]);
+                uint crc = BinaryPrimitives.ReadUInt32LittleEndian(header[16..20]);
 
-            byte[] payload = (flags & CaptureFormat.FlagBrotli) != 0
-                ? CaptureFormat.Decompress(body, (int)rawLen)
-                : body;
+                if (payloadLen <= CaptureFormat.MaxRecordBytes
+                    && offset + CaptureFormat.RecordHeaderSize + payloadLen <= fileLength)
+                {
+                    var body = new byte[(int)payloadLen];
+                    if (ReadBody(fs, (int)payloadLen, scratch, body) && Crc32.Compute(body) == crc)
+                    {
+                        byte[] payload = (flags & CaptureFormat.FlagBrotli) != 0
+                            ? CaptureFormat.Decompress(body, (int)rawLen)
+                            : body;
+                        yield return new CaptureRecord((CaptureRecordType)BinaryPrimitives.ReadUInt16LittleEndian(header[4..6]),
+                            payload, offset);
+                        continue;
+                    }
 
-            yield return new CaptureRecord(type, payload, offset);
+                    // The body is unreadable or does not match its checksum: the framing is
+                    // broken from here on, so the next record has to be found by content.
+                    reason = "a record body does not match its checksum";
+                    if (TryReportGap(fs, offset + CaptureFormat.RecordHeaderSize, fileLength, offset, reason, scratch, onIssue))
+                        continue;
+                    onIssue?.Invoke(new CaptureReadIssue(offset, fileLength - offset, reason, false));
+                    yield break;
+                }
+            }
+
+            // Not a header, or a header whose body is not there. Retry one byte later: the
+            // stub of a record whose header was cut in half still sits before good data.
+            if (TryReportGap(fs, offset + 1, fileLength, offset, reason, scratch, onIssue)) continue;
+            onIssue?.Invoke(new CaptureReadIssue(offset, fileLength - offset, reason, false));
+            yield break;
         }
+    }
+
+    /// <summary>
+    /// Look for the next record boundary after damage and, if one is found, move the
+    /// stream to it. Returns false when nothing readable follows — then the capture has
+    /// simply lost its tail, which is what an abrupt termination looks like.
+    /// </summary>
+    private static bool TryReportGap(FileStream fs, long from, long fileLength, long offset,
+        string reason, byte[] scratch, Action<CaptureReadIssue>? onIssue)
+    {
+        long? next = FindBoundary(fs, from, fileLength, scratch);
+        if (next == null) return false;
+
+        onIssue?.Invoke(new CaptureReadIssue(offset, next.Value - offset, reason, true));
+        fs.Seek(next.Value, SeekOrigin.Begin);
+        return true;
+    }
+
+    /// <summary>
+    /// The next offset that starts a run of intact records, or null if there is none
+    /// within the search window.
+    /// </summary>
+    private static long? FindBoundary(FileStream fs, long from, long fileLength, byte[] scratch)
+    {
+        long saved = fs.Position;
+        try
+        {
+            long end = Math.Min(fileLength, from + ResyncWindow);
+            long length = end - from;
+            if (length < CaptureFormat.RecordHeaderSize) return null;
+
+            var window = new byte[length];
+            fs.Seek(from, SeekOrigin.Begin);
+            if (!CaptureFormat.TryReadExactly(fs, window)) return null;
+
+            int candidates = 0;
+            for (int i = 0; i + CaptureFormat.RecordHeaderSize <= window.Length; i++)
+            {
+                if (!CaptureFormat.IsRecordHeader(window.AsSpan(i, 4))) continue;
+                if (++candidates > ResyncCandidates) return null;
+                if (IsRecordRun(fs, from + i, fileLength, scratch)) return from + i;
+            }
+            return null;
+        }
+        finally
+        {
+            fs.Seek(saved, SeekOrigin.Begin);
+        }
+    }
+
+    /// <summary>
+    /// Whether the records at this offset parse cleanly. Three in a row make a boundary;
+    /// fewer are accepted only if they lead exactly to the end of the file (the damaged
+    /// record may be the one before the last).
+    /// </summary>
+    private static bool IsRecordRun(FileStream fs, long offset, long fileLength, byte[] scratch)
+    {
+        long saved = fs.Position;
+        try
+        {
+            fs.Seek(offset, SeekOrigin.Begin);
+            var header = new byte[CaptureFormat.RecordHeaderSize];
+            int valid = 0;
+            while (valid < ResyncRunLength)
+            {
+                long here = fs.Position;
+                if (here + CaptureFormat.RecordHeaderSize > fileLength) break;
+                if (!CaptureFormat.TryReadExactly(fs, header)) break;
+                if (!CaptureFormat.IsRecordHeader(header)) break;
+
+                uint payloadLen = BinaryPrimitives.ReadUInt32LittleEndian(header[8..12]);
+                uint crc = BinaryPrimitives.ReadUInt32LittleEndian(header[16..20]);
+                if (payloadLen > CaptureFormat.MaxRecordBytes) break;
+                if (here + CaptureFormat.RecordHeaderSize + payloadLen > fileLength) break;
+                if (!VerifyBody(fs, (int)payloadLen, crc, scratch)) break;
+                valid++;
+            }
+
+            return valid >= ResyncRunLength || (valid > 0 && fs.Position == fileLength);
+        }
+        finally
+        {
+            fs.Seek(saved, SeekOrigin.Begin);
+        }
+    }
+
+    /// <summary>Read a body into <paramref name="into"/>; false if the stream ended first.</summary>
+    private static bool ReadBody(FileStream fs, int payloadLen, byte[] scratch, byte[] into)
+    {
+        int remaining = payloadLen;
+        int written = 0;
+        while (remaining > 0)
+        {
+            int n = fs.Read(scratch, 0, Math.Min(scratch.Length, remaining));
+            if (n <= 0) return false;
+            scratch.AsSpan(0, n).CopyTo(into.AsSpan(written));
+            written += n;
+            remaining -= n;
+        }
+        return true;
+    }
+
+    /// <summary>Check a body's CRC without keeping it.</summary>
+    private static bool VerifyBody(FileStream fs, int payloadLen, uint crc, byte[] scratch)
+    {
+        int remaining = payloadLen;
+        uint state = 0;
+        while (remaining > 0)
+        {
+            int n = fs.Read(scratch, 0, Math.Min(scratch.Length, remaining));
+            if (n <= 0) return false;
+            state = Crc32.Compute(state, scratch.AsSpan(0, n));
+            remaining -= n;
+        }
+        return state == crc;
     }
 
     /// <summary>Read only records of the given type.</summary>
@@ -441,11 +713,12 @@ public static class CaptureReader
     }
 
     /// <summary>Capture file summary: how many records of each type and how many bytes.</summary>
-    public static (Dictionary<CaptureRecordType, long> Counts, long TotalBytes) Summarize(string root)
+    public static (Dictionary<CaptureRecordType, long> Counts, long TotalBytes) Summarize(string root,
+        Action<CaptureReadIssue>? onIssue = null)
     {
         var counts = new Dictionary<CaptureRecordType, long>();
         long total = 0;
-        foreach (var record in Read(root))
+        foreach (var record in Read(root, onIssue))
         {
             counts[record.Type] = counts.GetValueOrDefault(record.Type) + 1;
             total += record.Payload.Length;
@@ -462,17 +735,5 @@ public static class CaptureReader
             if (n <= 0) throw new EndOfStreamException("Unexpected end of capture file");
             read += n;
         }
-    }
-
-    private static bool TryReadExactly(Stream s, Span<byte> buffer)
-    {
-        int read = 0;
-        while (read < buffer.Length)
-        {
-            int n = s.Read(buffer[read..]);
-            if (n <= 0) return false;
-            read += n;
-        }
-        return true;
     }
 }

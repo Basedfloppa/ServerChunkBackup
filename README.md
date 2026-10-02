@@ -22,6 +22,10 @@ Verified on Vintage Story **1.22.7** · .NET **10.0** · Linux.
                  │
                  │  every packet from the server: chunks, light, decor, block
                  │  entities, moddata, heightmaps, block registry, world parameters
+                 │  + entities from the live objects (positions come over UDP, not
+                 │  through the patched method)
+                 │  + the clock and the player position, so the built world opens at
+                 │  the captured moment, in the captured season, with the player there
                  ▼
       <DataPath>/FullCapture/<id>/        lossless capture (capture.vscap)
                  │
@@ -31,6 +35,8 @@ Verified on Vintage Story **1.22.7** · .NET **10.0** · Linux.
 
 The mod hooks the single method every server packet passes through, so it captures
 the maximum: blocks, light, light saturation, liquids, decor, **block entities**
-(chiseled blocks, chests, machines), moddata, column heightmaps, the block registry
-and world parameters. Region contents (`mapregion`) are not saved — the game
-rebuilds them from the seed.
+(chiseled blocks, chests, machines), **entities** (mobs, dropped items, item frames),
+**the world state** (the clock — from which the time of day and the season follow — and
+the player position, written into the save as `TotalGameSeconds` and `DefaultSpawn`),
+moddata, column heightmaps, the block registry and world parameters. Region contents
+(`mapregion`) are not saved — the game rebuilds them from the seed.

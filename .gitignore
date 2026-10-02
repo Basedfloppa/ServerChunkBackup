@@ -21,3 +21,6 @@ demo/
 
 # Ignore .folders
 **/.*/**
+
+# Ignore temporary local files
+tmp/**

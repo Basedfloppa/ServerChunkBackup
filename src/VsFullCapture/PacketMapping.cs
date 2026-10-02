@@ -1,3 +1,4 @@
+using Vintagestory.Common;
 using VsChunkDump.Core;
 
 namespace VsFullCapture;
@@ -84,6 +85,48 @@ public static class PacketMapping
             }
         }
         return payload;
+    }
+
+    /// <summary>
+    /// Calendar settings from the server's calendar packet.
+    ///
+    /// The packet carries its floats packed into ints (<c>CollectibleNet</c>), so they
+    /// are unpacked with the same helpers the game uses — reading the raw ints as
+    /// floats would silently produce nonsense (HoursPerDay would become 240000).
+    ///
+    /// The packet's own <c>TotalSeconds</c> is deliberately not taken: the current clock
+    /// comes from the client's calendar, which was set from this very packet and then
+    /// advanced locally, so it is the same clock read later (see WorldStateCapture).
+    /// <c>TotalSecondsStart</c> never advances, so the packet's value is the one to keep.
+    /// </summary>
+    public static CalendarSettings ToCalendarSettings(Packet_ServerCalendar p)
+    {
+        var settings = new CalendarSettings
+        {
+            TotalSecondsStart = p.TotalSecondsStart,
+            HoursPerDay = CollectibleNet.DeserializeFloatVeryPrecise(p.HoursPerDay),
+            DaysPerMonth = p.DaysPerMonth,
+            CalendarSpeedMul = CollectibleNet.DeserializeFloatVeryPrecise(p.CalendarSpeedMul),
+            // The same values can also be read from the client's calendar, with defaults
+            // where it does not expose them; the flag is what tells the two apart.
+            FromServer = true
+        };
+
+        string[]? names = p.TimeSpeedModifierNames;
+        int[]? speeds = p.TimeSpeedModifierSpeeds;
+        if (names == null || speeds == null) return settings;
+
+        int count = p.TimeSpeedModifierNamesCount > 0 && p.TimeSpeedModifierNamesCount <= names.Length
+            ? p.TimeSpeedModifierNamesCount
+            : names.Length;
+
+        for (int i = 0; i < count && i < speeds.Length; i++)
+        {
+            if (names[i] == null) continue;
+            settings.TimeSpeedModifiers.Add(new CalendarSettings.TimeSpeedModifier(
+                names[i], CollectibleNet.DeserializeFloatPrecise(speeds[i])));
+        }
+        return settings;
     }
 
     public static LevelInitPayload ToPayload(Packet_ServerLevelInitialize p) => new()

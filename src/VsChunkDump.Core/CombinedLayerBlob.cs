@@ -156,6 +156,54 @@ public static class CombinedLayerBlob
     /// <summary>
     /// Parse a layer palette. Returns false for an empty or corrupt blob.
     /// </summary>
+    /// <summary>
+    /// The block id at one position of a layer, read the way the game reads it:
+    /// the bit planes hold palette indices, bitsize bits per index, plane by plane.
+    ///
+    /// Needed to answer "which block is under this block entity" without the game:
+    /// an entity whose block is not under it must not be written (the game deletes
+    /// such entities on load, and a class that reads its block throws on the client).
+    /// <paramref name="index"/> is
+    /// <c>((y % 32) * 32 + z % 32) * 32 + x % 32</c> — the game's own formula.
+    /// </summary>
+    public static bool TryReadBlockId(byte[]? blob, IZstdCodec? codec, int index, out int blockId)
+    {
+        blockId = 0;
+        if (index < 0 || index >= 32768) return false;
+        if (!TryReadPalette(blob, codec, out int[]? palette, out bool compressed, out int bitPlaneOffset)) return false;
+        if (palette == null || palette.Length == 0) return false;
+
+        // A palette of one entry is the whole layer (the game treats count <= 1 as empty).
+        if (palette.Length == 1)
+        {
+            blockId = palette[0];
+            return true;
+        }
+
+        // The bit planes are always a zstd frame running to the end of the blob, even when
+        // the palette itself is stored raw; decompressed it is bitsize * 4096 bytes
+        // (32768 blocks * bitsize bits / 8), where bitsize is the game's floor(log2(count)).
+        if (codec == null) return false;
+        int frameLength = blob!.Length - bitPlaneOffset;
+        if (frameLength <= 0) return false;
+
+        byte[] planes = codec.Decompress(blob, bitPlaneOffset, frameLength);
+        if (planes == null || planes.Length == 0 || planes.Length % 4096 != 0) return false;
+        int bitsize = planes.Length / 4096;
+
+        int wordIndex = index >> 5, bit = index & 31;
+        int value = 0;
+        for (int plane = 0; plane < bitsize; plane++)
+        {
+            int word = BinaryPrimitives.ReadInt32LittleEndian(planes.AsSpan(plane * 4096 + wordIndex * 4, 4));
+            value |= ((word >> bit) & 1) << plane;
+        }
+
+        if (value < 0 || value >= palette.Length) return false;
+        blockId = palette[value];
+        return true;
+    }
+
     public static bool TryReadPalette(
         byte[]? blob,
         IZstdCodec? codec,
